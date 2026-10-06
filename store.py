@@ -28,12 +28,20 @@ DEFAULT_SETTINGS = {
     "weekly_on": True,
     "welcome_on": True,
     "promo_photo": True,
+    "stamp_cooldown": 30,       # хвилин між двома штампами одному клієнту (власника не стосується)
+    "stamp_daily_max": 3,       # штампів на день одному клієнту
+    "ref_on": True,             # запрошення друга
+    "ref_max": 5,               # скільки подарунків за друзів може отримати один клієнт
+    "birthday_on": True,
+    "birthday_min_days": 14,    # скільки днів клієнт має бути в боті, щоб отримати подарунок на ДН
 }
 TZ = ZoneInfo("Europe/Kyiv")
 DEFAULT_REWARDS = {
     "welcome": "Безкоштовний напій до першої кави",
     "stamps": "Безкоштовна кава «як завжди» ({usual})",
     "passport": "Круасан",
+    "referral": "Безкоштовна кава за запрошеного друга",
+    "birthday": "Напій у подарунок на день народження",
 }
 WD = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
 WD_ACC = ["понеділок", "вівторок", "середу", "четвер", "п'ятницю", "суботу", "неділю"]
@@ -42,7 +50,7 @@ WD_ACC = ["понеділок", "вівторок", "середу", "четве�
 def _empty():
     return {"users": {}, "orders": {}, "next_order": 1, "seeded": False, "promos": 0, "reviews": [],
             "log": [], "scheduled": [], "weekly_sent": "", "seeded_log": False,
-            "rewards": dict(DEFAULT_REWARDS), "settings": {}, "invites": {}, "off": {}}
+            "rewards": dict(DEFAULT_REWARDS), "settings": {}, "invites": {}, "off": {}, "actlog": [], "bday_sent": ""}
 
 
 class Store:
@@ -76,7 +84,8 @@ class Store:
     def goal_name(self, goal):
         return {"welcome": "вітальний подарунок",
                 "stamps": f"{self.cfg('stamps_goal')} штампів",
-                "passport": f"паспорт: {len(self.cfg('points'))} точки за {self.cfg('passport_days')} днів"}[goal]
+                "passport": f"паспорт: {len(self.cfg('points'))} точки за {self.cfg('passport_days')} днів",
+                "referral": "запрошення друга", "birthday": "день народження"}[goal]
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -163,6 +172,29 @@ class Store:
         return [(int(k), u) for k, u in self.d["users"].items() if u["last_visit"] < lim]
 
     # --- замовлення ---
+    # --- журнал дій персоналу та захист від зловживань ---
+    def log_action(self, kind, by, client, point, x=""):
+        """kind: stamp | redeem | blocked."""
+        a = self.d["actlog"]
+        a.append({"ts": time.time(), "kind": kind, "by": str(by), "client": str(client), "point": point, "x": x})
+        if len(a) > 5000:
+            del a[:len(a) - 5000]
+
+    def stamp_block(self, client):
+        """Текст причини, якщо клієнту зараз не можна ставити штамп (інакше None)."""
+        now = time.time()
+        mine = [e for e in self.d["actlog"] if e["kind"] == "stamp" and e["client"] == str(client)]
+        cd = self.cfg("stamp_cooldown")
+        if cd and mine and now - mine[-1]["ts"] < cd * 60:
+            left = int(cd - (now - mine[-1]["ts"]) / 60) + 1
+            return f"Цьому клієнту вже ставили штамп менше {cd} хв тому. Спробуйте за {left} хв."
+        day = datetime.now(TZ).date()
+        today = [e for e in mine if datetime.fromtimestamp(e["ts"], TZ).date() == day]
+        mx = self.cfg("stamp_daily_max")
+        if mx and len(today) >= mx:
+            return f"Сьогодні клієнт уже отримав {mx} штамп(и) — це денний ліміт."
+        return None
+
     # --- наявність (окремо для кожної точки) ---
     def is_on(self, cat, name, point):
         return point not in self.d["off"].get(f"{cat}:{name}", [])

@@ -15,7 +15,7 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButto
                            KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
 import promo as promo_img
-from store import WD, WD_ACC, Store
+from store import DAY, WD, WD_ACC, Store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("coffee")
@@ -249,10 +249,17 @@ async def start(m: Message, state: FSMContext, command: CommandObject):
         return
     u, new = st.ensure(uid, m.from_user.full_name)
     u["mode"] = "client"
+    invited = False
+    if new and arg.startswith("r_") and st.cfg("ref_on"):
+        rk_, ref = st.by_token(arg[2:])
+        if ref and rk_ != str(uid):
+            u["ref"], invited = rk_, True
     st.save()
     if new:
         await m.answer(
             f"Привіт, {esc(m.from_user.first_name)}! ☕\n"
+            + (f"Вас запросив(ла) {esc(st.user(u['ref'])['name'])}. Після вашого першого штампа ви обоє отримаєте подарунок.\n" if invited else "")
+            +
             f"Це бот «{esc(shop())}». Ми вже додали вам <b>подарунок</b>: {esc(st.reward_title('welcome'))}.\n\n"
             f"Збирайте штампи: кожен {goal_n()}-й напій у подарунок. "
             f"Штампи працюють у кав'ярні та на всіх будках.",
@@ -386,7 +393,9 @@ async def info_menu(m: Message, state: FSMContext):
     await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📍 Наші точки", callback_data="mn:points")],
-        [InlineKeyboardButton(text="⭐ Залишити відгук", callback_data="mn:review")]])
+        [InlineKeyboardButton(text="⭐ Залишити відгук", callback_data="mn:review")]]
+        + ([[InlineKeyboardButton(text="👥 Запросити друга", callback_data="mn:invite")]] if st.cfg("ref_on") else [])
+        + ([[InlineKeyboardButton(text="🎂 День народження", callback_data="mn:bday")]] if st.cfg("birthday_on") else []))
     await m.answer("Що показати?", reply_markup=kb)
 
 
@@ -402,6 +411,10 @@ async def menu_cb(c: CallbackQuery, state: FSMContext):
         await ask_prefs(c.message, c.from_user, state)
     elif act == "points":
         await c.message.answer(points_text())
+    elif act == "invite":
+        await show_invite(c.message, c.from_user)
+    elif act == "bday":
+        await bday_start(c.message, c.from_user, state)
     elif act == "review":
         await show_rating(c.message)
     await c.answer()
@@ -756,6 +769,59 @@ async def order_ready(c: CallbackQuery, bot: Bot):
     await c.answer("Клієнту надіслано")
 
 
+# --- запросити друга ---
+async def show_invite(m: Message, user):
+    u, _ = st.ensure(user.id, user.full_name)
+    link = f"https://t.me/{BOT_USERNAME}?start=r_{st.token(u)}"
+    from urllib.parse import quote
+    share = f"https://t.me/share/url?url={quote(link)}&text={quote('Заходь у «' + shop() + '» — після першого візиту ми обоє отримаємо каву в подарунок ☕')}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Надіслати другу", url=share)]])
+    left = max(0, st.cfg("ref_max") - u.get("ref_count", 0))
+    tail = f"\nДоступно винагород за друзів: {left}." if left else "\nЛіміт винагород за друзів вичерпано, але друзі й далі отримають свій подарунок."
+    await m.answer(f"👥 <b>Запросіть друга</b>\nПісля його першого штампа ви обоє отримаєте: {esc(st.reward_title('referral', u))}.{tail}",
+                   reply_markup=kb)
+
+
+# --- день народження ---
+class Birthday(StatesGroup):
+    date = State()
+
+
+def parse_bday(text):
+    import calendar
+    try:
+        d, mth = (int(x) for x in text.strip().replace("/", ".").replace("-", ".").split(".")[:2])
+    except ValueError:
+        return None
+    if not 1 <= mth <= 12 or not 1 <= d <= calendar.monthrange(2024, mth)[1]:
+        return None
+    return f"{d:02d}.{mth:02d}"
+
+
+async def bday_start(m: Message, user, state: FSMContext):
+    u, _ = st.ensure(user.id, user.full_name)
+    if u.get("bday"):
+        await m.answer(f"🎂 Ваш день народження: <b>{u['bday']}</b>. Змінити дату може тільки власник закладу.")
+        return
+    await state.set_state(Birthday.date)
+    await m.answer(f"🎂 Напишіть дату народження у форматі ДД.ММ, наприклад 14.03. У цей день ми подаруємо вам: "
+                   f"<b>{esc(st.reward_title('birthday', u))}</b>.\nДату можна вказати один раз.")
+
+
+@router.message(Birthday.date, ~F.text.in_(ALL_BTNS))
+async def bday_save(m: Message, state: FSMContext):
+    val = parse_bday(m.text or "")
+    if not val:
+        await m.answer("Не розумію дату. Приклад: 14.03")
+        return
+    u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    if not u.get("bday"):
+        u["bday"] = val
+        st.save()
+    await state.clear()
+    await m.answer(f"🎂 Записали: <b>{val}</b>. Чекайте на подарунок!", reply_markup=client_kb(m.from_user.id))
+
+
 # --- відгук ---
 @router.message(F.text == B_REVIEW)
 async def review_start(m: Message, state: FSMContext):
@@ -959,11 +1025,19 @@ async def change_point(m: Message, state: FSMContext):
                    f"Натисніть ще раз, щоб змінити.")
 
 
-async def apply_stamp(bot: Bot, me, k, u):
+async def apply_stamp(bot: Bot, me, k, u, by=None):
     """Штамп на точці бариста. Повертає текст для бариста."""
     point = me.get("point")
     if point not in points():
         point = points()[0]
+    if not (by and can_owner(by)):                     # власника ліміти не стосуються (демо, виправлення)
+        why = st.stamp_block(k)
+        if why:
+            st.log_action("blocked", by, k, point)
+            st.save()
+            return f"⛔ {why}"
+    first = u["stamps"] == 0 and not u.get("ref_paid") and not any(
+        e["kind"] == "stamp" and e["client"] == str(k) for e in st.d["actlog"])
     u["stamps"] += 1
     u["last_visit"] = time.time()
     gift = u["stamps"] >= goal_n()
@@ -972,6 +1046,8 @@ async def apply_stamp(bot: Bot, me, k, u):
         st.grant(u, "stamps")
     passed = st.passport_mark(u, point)
     st.log_visit(point)
+    st.log_action("stamp", by, k, point)
+    ref_note = await pay_referral(bot, k, u) if first else ""
     st.save()
     g_stamps = esc(st.reward_title("stamps", u))
     g_pass = esc(st.reward_title("passport", u))
@@ -987,13 +1063,35 @@ async def apply_stamp(bot: Bot, me, k, u):
         await safe_send(bot, int(k), txt)
     return (f"✅ Штамп додано: {esc(u['name'])} · {esc(point)}\n{bar(u['stamps'])} {u['stamps']}/{goal_n()}"
             + (f"\n🎉 Подарунок за штампи: {g_stamps}" if gift else "")
-            + (f"\n🧭 Паспорт пройдено — подарунок: {g_pass}" if passed else ""))
+            + (f"\n🧭 Паспорт пройдено — подарунок: {g_pass}" if passed else "")
+            + ref_note)
 
 
-async def apply_redeem(bot: Bot, k, u, goal=None):
+async def pay_referral(bot: Bot, k, u):
+    """Перший штамп запрошеного друга → подарунок йому й тому, хто запросив (з ліміту на запрошувача)."""
+    rk_ = u.get("ref")
+    if not rk_ or u.get("ref_paid") or not st.cfg("ref_on"):
+        return ""
+    u["ref_paid"] = True
+    st.grant(u, "referral")
+    note = "\n👥 Друг, якого запросили: подарунок нараховано."
+    ref = st.user(rk_)
+    if ref and ref.get("ref_count", 0) < st.cfg("ref_max"):
+        ref["ref_count"] = ref.get("ref_count", 0) + 1
+        st.grant(ref, "referral")
+        await safe_send(bot, int(rk_), f"👥 Ваш друг зробив перший візит! Подарунок: <b>{esc(st.reward_title('referral', ref))}</b>. "
+                                       f"Покажіть QR бариста.")
+        note = "\n👥 Запрошення: подарунок нараховано другу й тому, хто запросив."
+    if not u.get("demo"):
+        await safe_send(bot, int(k), f"🎁 Подарунок за запрошення: <b>{esc(st.reward_title('referral', u))}</b>.")
+    return note
+
+
+async def apply_redeem(bot: Bot, k, u, goal=None, by=None, point=None):
     g = st.take(u, goal) if goal else (u["gifts"].pop(0) if u["gifts"] else None)
     if not g:
         return f"У {esc(u['name'])} немає такого подарунка."
+    st.log_action("redeem", by, k, point, g["goal"])
     st.save()
     title = esc(st.reward_title(g["goal"], u))
     if not u.get("demo"):
@@ -1031,7 +1129,8 @@ async def card_action(c: CallbackQuery, bot: Bot):
         await c.answer("Клієнта не знайдено", show_alert=True)
         return
     me, _ = st.ensure(c.from_user.id, c.from_user.full_name)
-    res = await (apply_stamp(bot, me, k, u) if act == "cs" else apply_redeem(bot, k, u, rest[0] if rest else None))
+    res = await (apply_stamp(bot, me, k, u, c.from_user.id) if act == "cs"
+                 else apply_redeem(bot, k, u, rest[0] if rest else None, c.from_user.id, me.get("point")))
     await c.message.edit_text(c.message.html_text + "\n\n" + res)
     await c.answer()
 
@@ -1044,7 +1143,7 @@ async def stamp_code(m: Message, state: FSMContext, bot: Bot):
         return
     await state.clear()
     me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
-    await m.answer(await apply_stamp(bot, me, k, u))
+    await m.answer(await apply_stamp(bot, me, k, u, m.from_user.id))
 
 
 @router.message(StateFilter(None), F.text.regexp(r"^\d{6}$"), staff_only)
@@ -1056,7 +1155,7 @@ async def stamp_quick(m: Message, state: FSMContext, bot: Bot):
         return
     await state.clear()
     me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
-    await m.answer(await apply_stamp(bot, me, k, u))
+    await m.answer(await apply_stamp(bot, me, k, u, m.from_user.id))
 
 
 @router.message(F.text == O_REDEEM, staff_only)
@@ -1079,7 +1178,7 @@ async def redeem_code(m: Message, state: FSMContext, bot: Bot):
 async def rewards_menu(m: Message, state: FSMContext):
     await state.clear()
     rows = [[InlineKeyboardButton(text=f"{st.goal_name(g)}: {st.d['rewards'][g]}"[:60], callback_data=f"rw:{g}")]
-            for g in ("passport", "stamps", "welcome")]
+            for g in ("passport", "stamps", "welcome", "referral", "birthday")]
     await m.answer("🎁 <b>Нагороди за цілі</b>\nОберіть, що змінити. На кнопці — поточна нагорода.",
                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -1103,7 +1202,7 @@ async def rewards_save(m: Message, state: FSMContext):
     goal = (await state.get_data()).get("goal")
     await state.clear()
     text = (m.text or "").strip()[:80]
-    if goal not in ("welcome", "stamps", "passport") or not text:
+    if goal not in ("welcome", "stamps", "passport", "referral", "birthday") or not text:
         await m.answer("Не вдалося зберегти, спробуйте ще раз.")
         return
     st.d["rewards"][goal] = text
@@ -1219,6 +1318,32 @@ async def avail_cb(c: CallbackQuery):
 
 
 # ---------- персонал ----------
+def control_text():
+    """Контроль за 7 днів: штампи й подарунки по кожному, заблоковані спроби, клієнти з кількома штампами за день."""
+    lim = time.time() - 7 * DAY
+    rows = {}
+    for e in st.d["actlog"]:
+        if e["ts"] < lim or e["by"] in ("", "None"):
+            continue
+        r = rows.setdefault(e["by"], {"stamp": 0, "redeem": 0, "blocked": 0, "days": {}})
+        r[e["kind"]] += 1
+        if e["kind"] == "stamp":
+            d = (e["client"], datetime.fromtimestamp(e["ts"], TZ).date())
+            r["days"][d] = r["days"].get(d, 0) + 1
+    if not rows:
+        return "🛡 <b>Контроль за 7 днів</b>\nДій поки немає."
+    out = ["🛡 <b>Контроль за 7 днів</b>"]
+    for by, r in sorted(rows.items(), key=lambda x: -x[1]["stamp"]):
+        u = st.user(by) or {}
+        multi = sum(1 for n in r["days"].values() if n >= 2)
+        flags = (f" · ⚠️ заблоковано спроб: {r['blocked']}" if r["blocked"] else "") + \
+                (f" · клієнтів із 2+ штампами за день: {multi}" if multi else "")
+        out.append(f"• {esc(u.get('name', by))}: штампів {r['stamp']}, подарунків видано {r['redeem']}{flags}")
+    gifts = sum(r["redeem"] for r in rows.values())
+    out.append(f"Подарунків видано всього: {gifts}")
+    return "\n".join(out)
+
+
 @router.message(F.text == O_STAFF, owner_only)
 async def staff_menu(m: Message, state: FSMContext):
     await state.clear()
@@ -1229,7 +1354,8 @@ async def staff_menu(m: Message, state: FSMContext):
             lines.append(f"• {esc(u['name'])} · {esc(u.get('point', ''))}")
             rows.append([InlineKeyboardButton(text=f"❌ Прибрати: {u['name']}"[:60], callback_data=f"sf:rm:{i}")])
     txt = "👥 <b>Персонал</b>\n" + ("\n".join(lines) if lines else "Бариста поки немає.") + \
-          "\n\nБариста може: скануйте QR, ставити штампи, видавати подарунки, бачити й закривати замовлення. " \
+          "\n\n" + control_text() + \
+          "\n\nБариста може: ставити штампи, видавати подарунки, бачити й закривати замовлення. " \
           "Акції, звіти, нагороди й налаштування — тільки власнику."
     await m.answer(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -1266,10 +1392,15 @@ SETTING_ITEMS = [
     ("passport_days", "🧭 Паспорт: днів"), ("points", "📍 Точки"), ("drinks", "🍵 Напої та ціни"),
     ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
-    ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("promo_photo", "🖼 Картинка до акцій"), ("welcome_on", "🎁 Вітальний подарунок"),
+    ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("promo_photo", "🖼 Картинка до акцій"),
+    ("stamp_cooldown", "⏱ Пауза між штампами (хв)"), ("stamp_daily_max", "🔒 Штампів на день"),
+    ("ref_on", "👥 Запрошення друзів"), ("ref_max", "👥 Ліміт винагород за друзів"),
+    ("birthday_on", "🎂 Подарунок на ДН"), ("birthday_min_days", "🎂 Днів у боті до подарунка"), ("welcome_on", "🎁 Вітальний подарунок"),
 ]
-TOGGLES = {"weekly_on", "welcome_on", "promo_photo"}
+TOGGLES = {"weekly_on", "welcome_on", "promo_photo", "ref_on", "birthday_on"}
 PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
+NUM_RANGES = {"stamps_goal": (2, 30), "passport_days": (1, 60), "stamp_cooldown": (0, 240),
+              "stamp_daily_max": (0, 20), "ref_max": (0, 50), "birthday_min_days": (0, 365)}
 
 
 class Setting(StatesGroup):
@@ -1297,6 +1428,7 @@ SETTING_GROUPS = [
     ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
     ("shop", "🏷 Заклад", ["shop", "points", "maps"]),
+    ("safe", "🛡 Захист і бонуси", ["stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "birthday_on", "birthday_min_days"]),
     ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on", "promo_photo"]),
 ]
 
@@ -1340,6 +1472,10 @@ SETTING_HELP = {
               "Щоб прибрати крок сиропів — надішліть «-».",
     "desserts": "Десерти й ціни, кожен з нового рядка: «Назва - ціна». Приклад:\nКруасан - 55\nЧізкейк - 85\n"
                 "Щоб прибрати десерти з замовлення — надішліть «-».",
+    "stamp_cooldown": "Скільки хвилин має минути між двома штампами одному клієнту. 0 — без паузи. Власника це не стосується.",
+    "stamp_daily_max": "Максимум штампів на день одному клієнту. 0 — без ліміту.",
+    "ref_max": "Скільки подарунків за запрошених друзів може отримати один клієнт (0 — не нараховувати запрошувачу). Друг свій подарунок отримує завжди.",
+    "birthday_min_days": "Скільки днів клієнт має бути в боті, щоб отримати подарунок на день народження (захист від «вказав дату сьогодні». 0 — без обмеження).",
     "promos": "Шаблони акцій — кожен з нового рядка (від 1 до 6, до 150 символів).",
     "quiet": "Тихі години, коли в закладі мало людей. Формат «11-14» (години від 0 до 23).",
     "promo_time": "О котрій надсилати заплановану акцію? Формат «10:30».",
@@ -1357,8 +1493,8 @@ def parse_setting(key, text):
     try:
         if key == "shop":
             return (True, t[:40]) if t else (False, "Назва не може бути порожньою.")
-        if key in ("stamps_goal", "passport_days"):
-            lo, hi = (2, 30) if key == "stamps_goal" else (1, 60)
+        if key in NUM_RANGES:
+            lo, hi = NUM_RANGES[key]
             n = int(t)
             return (True, n) if lo <= n <= hi else (False, f"Потрібне число від {lo} до {hi}.")
         if key == "points":
@@ -1537,6 +1673,24 @@ async def week_action(c: CallbackQuery, bot: Bot):
     await c.answer()
 
 
+async def birthday_run(bot: Bot, n):
+    """Раз на день: клієнтам із днем народження сьогодні нараховує подарунок (раз на рік)."""
+    today = n.strftime("%d.%m")
+    cnt = 0
+    for k, u in list(st.d["users"].items()):
+        if u.get("bday") != today or u.get("demo") or u.get("bday_year") == n.year:
+            continue
+        if (time.time() - u.get("joined", time.time())) < st.cfg("birthday_min_days") * DAY:
+            continue
+        u["bday_year"] = n.year
+        st.grant(u, "birthday")
+        cnt += 1
+        await safe_send(bot, int(k), f"🎂 З днем народження! Подарунок від «{esc(shop())}»: "
+                                     f"<b>{esc(st.reward_title('birthday', u))}</b>. Покажіть QR бариста.")
+    st.save()
+    return cnt
+
+
 async def scheduler(bot: Bot):
     """Раз на 30 с: відкладені акції + щопонеділка о 09:00 розбір тижня власнику."""
     while True:
@@ -1550,6 +1704,9 @@ async def scheduler(bot: Bot):
                     log.info("scheduled promo: sent=%s", await broadcast(bot, x["text"]))
             n = datetime.now(TZ)
             key = n.strftime("%Y-%m-%d")
+            if st.cfg("birthday_on") and n.hour >= 9 and st.d.get("bday_sent") != key:
+                st.d["bday_sent"] = key
+                await birthday_run(bot, n)
             if st.cfg("weekly_on") and n.weekday() == 0 and n.hour == 9 and st.d.get("weekly_sent") != key:
                 st.d["weekly_sent"] = key
                 st.save()
