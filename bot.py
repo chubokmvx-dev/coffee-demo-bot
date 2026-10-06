@@ -7,7 +7,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -54,7 +54,8 @@ B_POINTS, B_REVIEW, B_CODE = "📍 Наші точки", "⭐ Відгук", "�
 B_USUAL, B_PREFS, B_PASS = "🔁 Як завжди", "✍️ Вподобання", "🧭 Паспорт і QR"   # B_USUAL/B_PREFS/B_ORDER/B_POINTS/B_REVIEW лишились для старих клавіатур
 B_MENU_ORDER, B_INFO = "☕ Замовити", "📍 Точки й відгук"
 B_TO_OWNER, B_TO_CLIENT = "🔐 Режим власника", "🔄 Режим клієнта"
-O_PROMO, O_BACK, O_STAMP = "📣 Акція", "💤 Повернути зниклих", "➕ Штамп за кодом"
+O_PROMO, O_BACK, O_STAMP = "📣 Акція", "💤 Повернути зниклих", "🔢 Ввести код"
+O_STAMP_OLD = "➕ Штамп за кодом"          # для старих клавіатур
 O_PROMO_OLD = "📣 Акція 11–14"          # для старих клавіатур
 O_REDEEM, O_REPORT = "🎁 Погасити подарунок", "📊 Звіт"
 O_WEEK, O_POINT, O_REWARDS = "🗓 Розбір тижня", "📍 Змінити точку", "🎁 Нагороди"
@@ -64,7 +65,7 @@ O_AVAIL = "📦 Наявність"
 O_MORE, O_LESS = "⋯ Більше", "⬅️ Назад"
 ALL_BTNS = {B_STAMPS, B_GIFTS, B_ORDER, B_POINTS, B_REVIEW, B_CODE, B_TO_OWNER, B_TO_CLIENT,
             B_USUAL, B_PREFS, B_PASS, O_PROMO, O_BACK, O_STAMP, O_REDEEM, O_REPORT, O_WEEK, O_POINT,
-            B_MENU_ORDER, B_INFO, O_REWARDS, O_PROMO_OLD, O_SETTINGS, O_STAFF, B_ORDERS, B_TO_BARISTA, O_AVAIL, O_MORE, O_LESS}
+            B_MENU_ORDER, B_INFO, O_REWARDS, O_PROMO_OLD, O_SETTINGS, O_STAFF, B_ORDERS, B_TO_BARISTA, O_AVAIL, O_MORE, O_LESS, O_STAMP_OLD}
 
 
 def rk(rows):
@@ -893,10 +894,10 @@ async def win_back_send(c: CallbackQuery, bot: Bot):
     await c.answer()
 
 
-@router.message(F.text == O_STAMP, staff_only)
+@router.message(F.text.in_({O_STAMP, O_STAMP_OLD}), staff_only)
 async def stamp_start(m: Message, state: FSMContext):
     await state.set_state(Stamp.code)
-    await m.answer("Найшвидше — відскануйте QR клієнта камерою телефона. Або введіть код клієнта (клієнт бачить його під QR у «🧭 Паспорт і QR»):")
+    await m.answer("Введіть код клієнта (6 цифр під його QR):")
 
 
 @router.message(F.text == O_MORE, owner_only)
@@ -1004,6 +1005,18 @@ async def stamp_code(m: Message, state: FSMContext, bot: Bot):
     k, u = st.by_code((m.text or "").strip())
     if not u:
         await m.answer("Такого коду немає. Спробуйте ще раз або натисніть іншу кнопку.")
+        return
+    await state.clear()
+    me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    await m.answer(await apply_stamp(bot, me, k, u))
+
+
+@router.message(StateFilter(None), F.text.regexp(r"^\d{6}$"), staff_only)
+async def stamp_quick(m: Message, state: FSMContext, bot: Bot):
+    """Бариста просто надсилає 6 цифр коду — без натискання кнопки."""
+    k, u = st.by_code(m.text.strip())
+    if not u:
+        await m.answer("Такого коду немає.")
         return
     await state.clear()
     me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
