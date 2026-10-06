@@ -1,13 +1,21 @@
-"""Мінімальне сховище в JSON-файлі + демо-база умовних клієнтів."""
-import json, os, random, tempfile, time
+"""Мінімальне сховище в JSON-файлі + демо-база умовних клієнтів і журнал візитів."""
+import json, os, random, time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 PATH = os.getenv("DATA_PATH", "/tmp/coffee_demo.json")
 STAMPS_FOR_GIFT = 8
+PASSPORT_DAYS = 7
+POINTS = ["Кав'ярня", "Будка №1", "Будка №2"]
 DAY = 86400
+TZ = ZoneInfo("Europe/Kyiv")
+WD = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
+WD_ACC = ["понеділок", "вівторок", "середу", "четвер", "п'ятницю", "суботу", "неділю"]
 
 
 def _empty():
-    return {"users": {}, "orders": {}, "next_order": 1, "seeded": False, "promos": 0, "reviews": []}
+    return {"users": {}, "orders": {}, "next_order": 1, "seeded": False, "promos": 0, "reviews": [],
+            "log": [], "scheduled": [], "weekly_sent": "", "seeded_log": False}
 
 
 class Store:
@@ -18,9 +26,13 @@ class Store:
                 self.d = json.load(f)
         except Exception:
             self.d = _empty()
-        if not self.d.get("seeded"):
+        for k, v in _empty().items():
+            self.d.setdefault(k, v)
+        if not self.d["seeded"]:
             self._seed()
-            self.save()
+        if not self.d["seeded_log"]:
+            self._seed_log()
+        self.save()
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -44,6 +56,22 @@ class Store:
             }
         self.d["seeded"] = True
 
+    def _seed_log(self):
+        """Демо-журнал візитів за 4 тижні. Навмисно слабкий вівторок 11–14, щоб розбір мав що знайти."""
+        rnd = random.Random(11)
+        base = {8: 7, 9: 9, 10: 8, 11: 4, 12: 5, 13: 4, 14: 5, 15: 6, 16: 7, 17: 8, 18: 6}
+        today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        for back in range(1, 29):
+            day = today.fromtimestamp(today.timestamp() - back * DAY, TZ)
+            for hour, n in base.items():
+                k = n
+                if hour in (11, 12, 13):
+                    k = round(n * (0.4 if day.weekday() == 1 else 1.0))
+                for _ in range(max(0, k + rnd.randint(-1, 1))):
+                    ts = day.replace(hour=hour, minute=rnd.randint(0, 59)).timestamp()
+                    self.d["log"].append({"ts": ts, "point": rnd.choice(POINTS), "demo": True})
+        self.d["seeded_log"] = True
+
     # --- користувачі ---
     def user(self, uid):
         return self.d["users"].get(str(uid))
@@ -55,7 +83,8 @@ class Store:
         used = {x["code"] for x in self.d["users"].values()}
         code = next(c for c in (f"{random.randint(1000, 8999)}" for _ in range(10_000)) if c not in used)
         u = {"name": name, "phone": None, "demo": False, "stamps": 0, "gifts": 1, "mode": "client",
-             "joined": time.time(), "last_visit": time.time(), "code": code, "owner_ok": False}
+             "joined": time.time(), "last_visit": time.time(), "code": code, "owner_ok": False,
+             "point": POINTS[0], "pass": {}, "last": None, "prefs": ""}
         self.d["users"][str(uid)] = u
         self.save()
         return u, True
@@ -84,3 +113,49 @@ class Store:
                                     "point": point, "ts": time.time(), "done": False}
         self.save()
         return n
+
+    # --- паспорт ---
+    def passport_state(self, u):
+        lim = time.time() - PASSPORT_DAYS * DAY
+        have = {p: ts for p, ts in (u.get("pass") or {}).items() if ts >= lim}
+        left = None
+        if have:
+            left = max(0, int((min(have.values()) + PASSPORT_DAYS * DAY - time.time()) // DAY) + 1)
+        return have, left
+
+    def passport_mark(self, u, point):
+        """Відмітка візиту на точці. True, якщо паспорт щойно пройдено (усі точки за тиждень)."""
+        have, _ = self.passport_state(u)
+        have[point] = time.time()
+        if all(p in have for p in POINTS):
+            u["pass"] = {}
+            u["gifts"] += 1
+            return True
+        u["pass"] = have
+        return False
+
+    # --- журнал і розбір ---
+    def log_visit(self, point):
+        self.d["log"].append({"ts": time.time(), "point": point, "demo": False})
+
+    def weak_slot(self):
+        """Найслабший день тижня у годинах 11–14 за 4 тижні. None, якщо даних замало."""
+        lim = time.time() - 28 * DAY
+        sums = [0] * 7
+        real = 0
+        for e in self.d["log"]:
+            if e["ts"] < lim:
+                continue
+            dt = datetime.fromtimestamp(e["ts"], TZ)
+            if 11 <= dt.hour < 14:
+                sums[dt.weekday()] += 1
+                real += 0 if e.get("demo") else 1
+        avg = [s / 4 for s in sums]            # у вікні 28 днів кожен день тижня зустрічається 4 рази
+        if sum(avg) == 0:
+            return None
+        wd = min(range(7), key=lambda i: avg[i])
+        others = [a for i, a in enumerate(avg) if i != wd]
+        other = sum(others) / len(others)
+        if other <= 0:
+            return None
+        return {"wd": wd, "weak": avg[wd], "other": other, "real": real}
