@@ -701,11 +701,10 @@ async def passport(m: Message, state: FSMContext):
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
     have, left = st.passport_state(u)
     rows = "\n".join(f"{'✅' if p in have else '⬜'} {esc(p)}" for p in points())
-    tail = (f"Лишилось днів: <b>{left}</b>." if have else f"Відвідайте всі точки за {pdays()} днів.")
-    caption = (f"🧭 <b>Кавовий паспорт</b>\nКав'ярня й обидві будки за {pdays()} днів — подарунок: "
-               f"<b>{esc(st.reward_title('passport', u))}</b>.\n\n"
-               f"{rows}\n{tail}\n\n📲 Покажіть цей QR бариста на касі.\n"
-               f"Якщо не зчитується — назвіть код: <code>{u['code']}</code>")
+    left_txt = f" · ще {left} дн." if have else ""
+    caption = (f"<b>Паспорт</b> · {len(have)}/{len(points())}{left_txt}\n\n{rows}\n\n"
+               f"🎁 {esc(st.reward_title('passport', u))}\n"
+               f"Код: <code>{u['code']}</code>")
     try:
         png = qr_png(client_link(u))
     except Exception:
