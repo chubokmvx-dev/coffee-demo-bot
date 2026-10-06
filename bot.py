@@ -61,9 +61,10 @@ O_WEEK, O_POINT, O_REWARDS = "🗓 Розбір тижня", "📍 Змінит�
 O_SETTINGS, O_STAFF, B_ORDERS = "⚙️ Налаштування", "👥 Персонал", "🧾 Замовлення"
 B_TO_BARISTA = "👨‍🍳 Режим бариста"
 O_AVAIL = "📦 Наявність"
+O_MORE, O_LESS = "⋯ Більше", "⬅️ Назад"
 ALL_BTNS = {B_STAMPS, B_GIFTS, B_ORDER, B_POINTS, B_REVIEW, B_CODE, B_TO_OWNER, B_TO_CLIENT,
             B_USUAL, B_PREFS, B_PASS, O_PROMO, O_BACK, O_STAMP, O_REDEEM, O_REPORT, O_WEEK, O_POINT,
-            B_MENU_ORDER, B_INFO, O_REWARDS, O_PROMO_OLD, O_SETTINGS, O_STAFF, B_ORDERS, B_TO_BARISTA, O_AVAIL}
+            B_MENU_ORDER, B_INFO, O_REWARDS, O_PROMO_OLD, O_SETTINGS, O_STAFF, B_ORDERS, B_TO_BARISTA, O_AVAIL, O_MORE, O_LESS}
 
 
 def rk(rows):
@@ -71,17 +72,22 @@ def rk(rows):
 
 
 def client_kb(uid):
-    rows = [[B_MENU_ORDER, B_PASS], [B_STAMPS, B_GIFTS], [B_INFO]]
+    rows = [[B_MENU_ORDER, B_PASS], [B_STAMPS, B_GIFTS]]
     if can_owner(uid):
-        rows.append([B_TO_OWNER])
+        rows.append([B_INFO, B_TO_OWNER])
     elif is_barista(uid):
-        rows.append([B_TO_BARISTA])
+        rows.append([B_INFO, B_TO_BARISTA])
+    else:
+        rows.append([B_INFO])
     return rk(rows)
 
 
 def owner_kb():
-    return rk([[O_PROMO, O_BACK], [O_STAMP, O_REDEEM], [B_ORDERS, O_AVAIL], [O_POINT, O_WEEK], [O_REPORT, O_REWARDS],
-               [O_SETTINGS, O_STAFF], [B_TO_CLIENT]])
+    return rk([[O_STAMP, O_REDEEM], [B_ORDERS, O_AVAIL], [O_MORE, B_TO_CLIENT]])
+
+
+def owner_more_kb():
+    return rk([[O_PROMO, O_BACK], [O_WEEK, O_REPORT], [O_REWARDS, O_SETTINGS], [O_STAFF, O_POINT], [O_LESS]])
 
 
 def barista_kb():
@@ -872,6 +878,18 @@ async def stamp_start(m: Message, state: FSMContext):
     await m.answer("Найшвидше — відскануйте QR клієнта камерою телефона. Або введіть код клієнта (клієнт бачить його під QR у «🧭 Паспорт і QR»):")
 
 
+@router.message(F.text == O_MORE, owner_only)
+async def more_menu(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("⋯", reply_markup=owner_more_kb())
+
+
+@router.message(F.text == O_LESS, owner_only)
+async def less_menu(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("·", reply_markup=owner_kb())
+
+
 @router.message(F.text == O_POINT, staff_only)
 async def change_point(m: Message, state: FSMContext):
     await state.clear()
@@ -1198,11 +1216,37 @@ def setting_value(key):
     return str(v)
 
 
-def settings_kb():
+SETTING_GROUPS = [
+    ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
+    ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
+    ("shop", "🏷 Заклад", ["shop", "points", "maps_url"]),
+    ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on"]),
+]
+
+
+def group_of(key):
+    return next((g for g, _, keys in SETTING_GROUPS if key in keys), None)
+
+
+def btn_value(key):
+    if key in PRICE_KEYS or key == "points":
+        return str(len(st.cfg(key)))
+    if key == "maps_url":
+        return "задано"
+    return setting_value(key)
+
+
+def settings_kb(group=None):
+    labels = dict(SETTING_ITEMS)
+    if group is None:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=title, callback_data=f"stg:g:{g}")] for g, title, _ in SETTING_GROUPS])
+    keys = next(k for g, _, k in SETTING_GROUPS if g == group)
     rows = []
-    for key, label in SETTING_ITEMS:
+    for key in keys:
         cb = f"stg:t:{key}" if key in TOGGLES else f"stg:e:{key}"
-        rows.append([InlineKeyboardButton(text=f"{label}: {setting_value(key)}"[:60], callback_data=cb)])
+        rows.append([InlineKeyboardButton(text=f"{labels[key]} · {btn_value(key)}"[:60], callback_data=cb)])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="stg:g:root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1284,8 +1328,7 @@ def parse_setting(key, text):
 @router.message(F.text == O_SETTINGS, owner_only)
 async def settings_menu(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("⚙️ <b>Налаштування</b>\nНатисніть пункт, щоб змінити. Нагороди — окремою кнопкою «🎁 Нагороди».",
-                   reply_markup=settings_kb())
+    await m.answer("⚙️ <b>Налаштування</b>", reply_markup=settings_kb())
 
 
 @router.callback_query(F.data.startswith("stg:"))
@@ -1294,10 +1337,12 @@ async def settings_cb(c: CallbackQuery, state: FSMContext):
         await c.answer("Недоступно", show_alert=True)
         return
     _, act, key = c.data.split(":")
-    if act == "t" and key in TOGGLES:
+    if act == "g":
+        await c.message.edit_reply_markup(reply_markup=settings_kb(None if key == "root" else key))
+    elif act == "t" and key in TOGGLES:
         st.d["settings"][key] = not st.cfg(key)
         st.save()
-        await c.message.edit_reply_markup(reply_markup=settings_kb())
+        await c.message.edit_reply_markup(reply_markup=settings_kb(group_of(key)))
     elif act == "e" and key in SETTING_HELP:
         await state.set_state(Setting.entry)
         await state.update_data(key=key)
@@ -1320,7 +1365,7 @@ async def settings_save(m: Message, state: FSMContext):
     else:
         st.d["settings"][key] = val
     st.save()
-    await m.answer("✅ Збережено.", reply_markup=settings_kb())
+    await m.answer("✅ Збережено.", reply_markup=settings_kb(group_of(key)))
 
 
 # ---------- тижневий розбір ----------
