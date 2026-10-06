@@ -1025,6 +1025,31 @@ async def change_point(m: Message, state: FSMContext):
                    f"Натисніть ще раз, щоб змінити.")
 
 
+def min_check():
+    """Мінімальна сума чека для штампа = ціна найдешевшого напою з меню (власнику нічого налаштовувати не треба)."""
+    return min((p for _, p in drinks()), default=0)
+
+
+def stamp_confirm_kb(tok):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Купівля від {min_check()} грн", callback_data=f"cc:{tok}")],
+        [InlineKeyboardButton(text="✖️ Скасувати", callback_data="cc:x")]])
+
+
+async def stamp_flow(m: Message, bot: Bot, me, k, u, by):
+    """Штамп за кодом: або одразу, або після підтвердження покупки (налаштування «Штамп за покупку»)."""
+    if st.cfg("stamp_confirm"):
+        if not can_owner(by):
+            why = st.stamp_block(k)
+            if why:
+                await m.answer(f"⛔ {why}")
+                return
+        await m.answer(f"👤 <b>{esc(u['name'])}</b>\nШтамп ставимо лише за покупку напою від {min_check()} грн.",
+                       reply_markup=stamp_confirm_kb(st.token(u)))
+        return
+    await m.answer(await apply_stamp(bot, me, k, u, by))
+
+
 async def apply_stamp(bot: Bot, me, k, u, by=None):
     """Штамп на точці бариста. Повертає текст для бариста."""
     point = me.get("point")
@@ -1046,7 +1071,7 @@ async def apply_stamp(bot: Bot, me, k, u, by=None):
         st.grant(u, "stamps")
     passed = st.passport_mark(u, point)
     st.log_visit(point)
-    st.log_action("stamp", by, k, point)
+    st.log_action("stamp", by, k, point, f"від {min_check()}" if st.cfg("stamp_confirm") else "")
     ref_note = await pay_referral(bot, k, u) if first else ""
     st.save()
     g_stamps = esc(st.reward_title("stamps", u))
@@ -1129,9 +1154,40 @@ async def card_action(c: CallbackQuery, bot: Bot):
         await c.answer("Клієнта не знайдено", show_alert=True)
         return
     me, _ = st.ensure(c.from_user.id, c.from_user.full_name)
+    if act == "cs" and st.cfg("stamp_confirm"):
+        if not can_owner(c.from_user.id):
+            why = st.stamp_block(k)
+            if why:
+                await c.message.edit_text(c.message.html_text + f"\n\n⛔ {why}")
+                await c.answer()
+                return
+        await c.message.edit_text(c.message.html_text + f"\n\nШтамп ставимо лише за покупку напою від {min_check()} грн.",
+                                  reply_markup=stamp_confirm_kb(tok))
+        await c.answer()
+        return
     res = await (apply_stamp(bot, me, k, u, c.from_user.id) if act == "cs"
                  else apply_redeem(bot, k, u, rest[0] if rest else None, c.from_user.id, me.get("point")))
     await c.message.edit_text(c.message.html_text + "\n\n" + res)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("cc:"))
+async def stamp_confirmed(c: CallbackQuery, bot: Bot):
+    if not can_staff(c.from_user.id):
+        await c.answer("Недоступно", show_alert=True)
+        return
+    tok = c.data[3:]
+    if tok == "x":
+        await c.message.edit_text("Скасовано.")
+        await c.answer()
+        return
+    k, u = st.by_token(tok)
+    if not u:
+        await c.answer("Клієнта не знайдено", show_alert=True)
+        return
+    me, _ = st.ensure(c.from_user.id, c.from_user.full_name)
+    res = await apply_stamp(bot, me, k, u, c.from_user.id)
+    await c.message.edit_text(res)
     await c.answer()
 
 
@@ -1143,7 +1199,7 @@ async def stamp_code(m: Message, state: FSMContext, bot: Bot):
         return
     await state.clear()
     me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
-    await m.answer(await apply_stamp(bot, me, k, u, m.from_user.id))
+    await stamp_flow(m, bot, me, k, u, m.from_user.id)
 
 
 @router.message(StateFilter(None), F.text.regexp(r"^\d{6}$"), staff_only)
@@ -1155,7 +1211,7 @@ async def stamp_quick(m: Message, state: FSMContext, bot: Bot):
         return
     await state.clear()
     me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
-    await m.answer(await apply_stamp(bot, me, k, u, m.from_user.id))
+    await stamp_flow(m, bot, me, k, u, m.from_user.id)
 
 
 @router.message(F.text == O_REDEEM, staff_only)
@@ -1393,11 +1449,11 @@ SETTING_ITEMS = [
     ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
     ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("promo_photo", "🖼 Картинка до акцій"),
-    ("stamp_cooldown", "⏱ Пауза між штампами (хв)"), ("stamp_daily_max", "🔒 Штампів на день"),
+    ("stamp_confirm", "🧾 Штамп за покупку (від ціни найдешевшої кави)"), ("stamp_cooldown", "⏱ Пауза між штампами (хв)"), ("stamp_daily_max", "🔒 Штампів на день"),
     ("ref_on", "👥 Запрошення друзів"), ("ref_max", "👥 Ліміт винагород за друзів"),
     ("birthday_on", "🎂 Подарунок на ДН"), ("birthday_min_days", "🎂 Днів у боті до подарунка"), ("welcome_on", "🎁 Вітальний подарунок"),
 ]
-TOGGLES = {"weekly_on", "welcome_on", "promo_photo", "ref_on", "birthday_on"}
+TOGGLES = {"weekly_on", "welcome_on", "promo_photo", "ref_on", "birthday_on", "stamp_confirm"}
 PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
 NUM_RANGES = {"stamps_goal": (2, 30), "passport_days": (1, 60), "stamp_cooldown": (0, 240),
               "stamp_daily_max": (0, 20), "ref_max": (0, 50), "birthday_min_days": (0, 365)}
@@ -1428,7 +1484,7 @@ SETTING_GROUPS = [
     ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
     ("shop", "🏷 Заклад", ["shop", "points", "maps"]),
-    ("safe", "🛡 Захист і бонуси", ["stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "birthday_on", "birthday_min_days"]),
+    ("safe", "🛡 Захист і бонуси", ["stamp_confirm", "stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "birthday_on", "birthday_min_days"]),
     ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on", "promo_photo"]),
 ]
 

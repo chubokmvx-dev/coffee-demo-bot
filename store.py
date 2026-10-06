@@ -28,6 +28,7 @@ DEFAULT_SETTINGS = {
     "weekly_on": True,
     "welcome_on": True,
     "promo_photo": True,
+    "stamp_confirm": True,      # штамп лише після підтвердження покупки від ціни найдешевшого напою
     "stamp_cooldown": 30,       # хвилин між двома штампами одному клієнту (власника не стосується)
     "stamp_daily_max": 3,       # штампів на день одному клієнту
     "ref_on": True,             # запрошення друга
