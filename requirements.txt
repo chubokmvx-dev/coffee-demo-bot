@@ -1,2 +1,3 @@
 aiogram>=3.13,<4
 segno>=1.6
+Pillow>=10

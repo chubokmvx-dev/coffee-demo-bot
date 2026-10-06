@@ -27,6 +27,7 @@ DEFAULT_SETTINGS = {
     "promo_time": "10:30",
     "weekly_on": True,
     "welcome_on": True,
+    "promo_photo": True,
 }
 TZ = ZoneInfo("Europe/Kyiv")
 DEFAULT_REWARDS = {

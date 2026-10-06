@@ -14,6 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
+import promo as promo_img
 from store import WD, WD_ACC, Store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -141,6 +142,29 @@ async def safe_send(bot, chat_id, text, **kw):
     except TelegramAPIError as e:
         log.warning("send to %s failed: %s", chat_id, e)
         return False
+
+
+def promo_png(text):
+    """Картинка до акції (None, якщо вимкнено або не вдалось намалювати — тоді піде звичайний текст)."""
+    if not st.cfg("promo_photo"):
+        return None
+    try:
+        return promo_img.render(text, shop())
+    except Exception:
+        log.exception("promo image")
+        return None
+
+
+async def send_promo(bot, chat_id, text, png=None, **kw):
+    if png:
+        try:
+            await bot.send_photo(chat_id, BufferedInputFile(png, filename="promo.jpg"), caption=esc(text)[:1000], **kw)
+            return True
+        except TelegramAPIError as e:
+            log.warning("promo photo to %s failed: %s", chat_id, e)
+            if kw.get("reply_markup") is None:
+                return False
+    return await safe_send(bot, chat_id, text, **kw)
 
 
 BOT_USERNAME = ""
@@ -837,8 +861,12 @@ async def promo_preview(msg: Message, state: FSMContext, text: str):
     real = len(st.real())
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Надіслати", callback_data="ps"),
                                                 InlineKeyboardButton(text="Скасувати", callback_data="px")]])
-    await msg.answer(f"Так побачать клієнти:\n\n{esc(text)}\n\nОтримувачів: {real} у боті + {st.demo_count()} у демо-базі.",
-                     reply_markup=kb)
+    info = f"Отримувачів: {real} у боті + {st.demo_count()} у демо-базі."
+    png = promo_png(text)
+    if png:
+        await msg.answer_photo(BufferedInputFile(png, filename="promo.jpg"), caption=f"{esc(text)}\n\n{info}"[:1000], reply_markup=kb)
+    else:
+        await msg.answer(f"Так побачать клієнти:\n\n{esc(text)}\n\n{info}", reply_markup=kb)
 
 
 @router.callback_query(F.data == "ps")
@@ -851,22 +879,30 @@ async def promo_send(c: CallbackQuery, state: FSMContext, bot: Bot):
         await c.answer("Немає тексту, почніть спочатку", show_alert=True)
         return
     sent = 0
+    png = promo_png(text)
     for uid, _ in st.real():
-        if await safe_send(bot, uid, text):
+        if await send_promo(bot, uid, text, png):
             sent += 1
         await asyncio.sleep(0.05)
     st.d["promos"] = st.d.get("promos", 0) + 1
     st.save()
     await state.clear()
-    await c.message.edit_text(f"✅ Надіслано: {sent} реальним підписникам (+ {st.demo_count()} у демо-базі умовно).\n"
-                              f"Результат дивіться у «{O_REPORT}»: продажі 11–14 до і після.")
+    done = (f"✅ Надіслано: {sent} реальним підписникам (+ {st.demo_count()} у демо-базі умовно).\n"
+            f"Результат дивіться у «{O_REPORT}»: продажі 11–14 до і після.")
+    if c.message.photo:
+        await c.message.edit_caption(caption=done)
+    else:
+        await c.message.edit_text(done)
     await c.answer()
 
 
 @router.callback_query(F.data == "px")
 async def promo_cancel(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await c.message.edit_text("Скасовано.")
+    if c.message.photo:
+        await c.message.edit_caption(caption="Скасовано.")
+    else:
+        await c.message.edit_text("Скасовано.")
     await c.answer()
 
 
@@ -1230,9 +1266,9 @@ SETTING_ITEMS = [
     ("passport_days", "🧭 Паспорт: днів"), ("points", "📍 Точки"), ("drinks", "🍵 Напої та ціни"),
     ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
-    ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("welcome_on", "🎁 Вітальний подарунок"),
+    ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("promo_photo", "🖼 Картинка до акцій"), ("welcome_on", "🎁 Вітальний подарунок"),
 ]
-TOGGLES = {"weekly_on", "welcome_on"}
+TOGGLES = {"weekly_on", "welcome_on", "promo_photo"}
 PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
 
 
@@ -1261,7 +1297,7 @@ SETTING_GROUPS = [
     ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
     ("shop", "🏷 Заклад", ["shop", "points", "maps"]),
-    ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on"]),
+    ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on", "promo_photo"]),
 ]
 
 
@@ -1461,8 +1497,9 @@ def build_review():
 
 async def broadcast(bot: Bot, text: str):
     sent = 0
+    png = promo_png(text)
     for uid, _ in st.real():
-        if await safe_send(bot, uid, text):
+        if await send_promo(bot, uid, text, png):
             sent += 1
         await asyncio.sleep(0.05)
     return sent
