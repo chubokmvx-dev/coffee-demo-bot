@@ -817,7 +817,7 @@ async def rewards_save(m: Message, state: FSMContext):
     goal = (await state.get_data()).get("goal")
     await state.clear()
     text = (m.text or "").strip()[:80]
-    if goal not in GOAL_NAMES or not text:
+    if goal not in ("welcome", "stamps", "passport") or not text:
         await m.answer("Не вдалося зберегти, спробуйте ще раз.")
         return
     st.d["rewards"][goal] = text
