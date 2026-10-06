@@ -14,7 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
-from store import PASSPORT_DAYS, POINTS, STAMPS_FOR_GIFT, WD, WD_ACC, Store
+from store import GOAL_NAMES, PASSPORT_DAYS, POINTS, STAMPS_FOR_GIFT, WD, WD_ACC, Store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("coffee")
@@ -40,13 +40,15 @@ router = Router()
 # ---------- кнопки ----------
 B_STAMPS, B_GIFTS, B_ORDER = "☕ Мої штампи", "🎁 Подарунки", "⏱ Замовити наперед"
 B_POINTS, B_REVIEW, B_CODE = "📍 Наші точки", "⭐ Відгук", "📲 Мій код"   # B_CODE лишився лише для старих клавіатур
-B_USUAL, B_PREFS, B_PASS = "🔁 Як завжди", "✍️ Вподобання", "🧭 Паспорт і QR"
+B_USUAL, B_PREFS, B_PASS = "🔁 Як завжди", "✍️ Вподобання", "🧭 Паспорт і QR"   # B_USUAL/B_PREFS/B_ORDER/B_POINTS/B_REVIEW лишились для старих клавіатур
+B_MENU_ORDER, B_INFO = "☕ Замовити", "📍 Точки й відгук"
 B_TO_OWNER, B_TO_CLIENT = "🔐 Режим власника", "🔄 Режим клієнта"
 O_PROMO, O_BACK, O_STAMP = "📣 Акція 11–14", "💤 Повернути зниклих", "➕ Штамп за кодом"
 O_REDEEM, O_REPORT = "🎁 Погасити подарунок", "📊 Звіт"
-O_WEEK, O_POINT = "🗓 Розбір тижня", "📍 Змінити точку"
+O_WEEK, O_POINT, O_REWARDS = "🗓 Розбір тижня", "📍 Змінити точку", "🎁 Нагороди"
 ALL_BTNS = {B_STAMPS, B_GIFTS, B_ORDER, B_POINTS, B_REVIEW, B_CODE, B_TO_OWNER, B_TO_CLIENT,
-            B_USUAL, B_PREFS, B_PASS, O_PROMO, O_BACK, O_STAMP, O_REDEEM, O_REPORT, O_WEEK, O_POINT}
+            B_USUAL, B_PREFS, B_PASS, O_PROMO, O_BACK, O_STAMP, O_REDEEM, O_REPORT, O_WEEK, O_POINT,
+            B_MENU_ORDER, B_INFO, O_REWARDS}
 
 
 def rk(rows):
@@ -54,14 +56,14 @@ def rk(rows):
 
 
 def client_kb(uid):
-    rows = [[B_USUAL, B_ORDER], [B_STAMPS, B_PASS], [B_GIFTS, B_POINTS], [B_REVIEW, B_PREFS]]
+    rows = [[B_MENU_ORDER, B_PASS], [B_STAMPS, B_GIFTS], [B_INFO]]
     if can_owner(uid):
         rows.append([B_TO_OWNER])
     return rk(rows)
 
 
 def owner_kb():
-    return rk([[O_PROMO, O_BACK], [O_STAMP, O_REDEEM], [O_WEEK, O_REPORT], [O_POINT, B_TO_CLIENT]])
+    return rk([[O_PROMO, O_BACK], [O_STAMP, O_REDEEM], [O_WEEK, O_REPORT], [O_REWARDS, O_POINT], [B_TO_CLIENT]])
 
 
 def can_owner(uid):
@@ -134,6 +136,10 @@ class Prefs(StatesGroup):
     text = State()
 
 
+class Reward(StatesGroup):
+    text = State()
+
+
 # ---------- старт ----------
 @router.message(CommandStart())
 async def start(m: Message, state: FSMContext, command: CommandObject):
@@ -155,7 +161,7 @@ async def start(m: Message, state: FSMContext, command: CommandObject):
     if new:
         await m.answer(
             f"Привіт, {esc(m.from_user.first_name)}! ☕\n"
-            f"Це бот «{esc(SHOP)}». Ми вже додали вам <b>подарунок</b> — безкоштовний напій до першої кави.\n\n"
+            f"Це бот «{esc(SHOP)}». Ми вже додали вам <b>подарунок</b>: {esc(st.reward_title('welcome'))}.\n\n"
             f"Збирайте штампи: кожен {STAMPS_FOR_GIFT}-й напій у подарунок. "
             f"Штампи працюють у кав'ярні та на всіх будках.",
             reply_markup=client_kb(uid))
@@ -230,30 +236,84 @@ async def my_stamps(m: Message, state: FSMContext):
                    f"До подарунка лишилось: <b>{left}</b>. Покажіть бариста QR із «{B_PASS}».")
 
 
+def gift_lines(u):
+    return "\n".join(f"• <b>{esc(st.reward_title(g['goal'], u))}</b> — {GOAL_NAMES[g['goal']]}" for g in u["gifts"])
+
+
 @router.message(F.text == B_GIFTS)
 async def my_gifts(m: Message, state: FSMContext):
     await state.clear()
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    have, _left = st.passport_state(u)
+    goals = (f"🎯 <b>Як отримати подарунок</b>\n"
+             f"☕ {STAMPS_FOR_GIFT} штампів ({u['stamps']}/{STAMPS_FOR_GIFT}) → {esc(st.reward_title('stamps', u))}\n"
+             f"🧭 Паспорт ({len(have)}/{len(POINTS)} точок за {PASSPORT_DAYS} днів) → {esc(st.reward_title('passport', u))}")
     if u["gifts"]:
-        await m.answer(f"🎁 У вас подарунків: <b>{u['gifts']}</b>.\nПокажіть QR із «{B_PASS}» бариста, щоб забрати.")
+        await m.answer(f"🎁 <b>Ваші подарунки</b>\n{gift_lines(u)}\n\nПокажіть QR із «{B_PASS}» бариста, щоб забрати.\n\n{goals}")
     else:
-        await m.answer("Подарунків поки немає. Збирайте штампи ☕")
+        await m.answer(f"Подарунків поки немає.\n\n{goals}")
+
+
+def points_text():
+    return ("📍 <b>Наші точки</b>\n" + "\n".join(f"• {p}" for p in POINTS) +
+            "\n\nШтампи й подарунки діють на всіх точках.")
 
 
 @router.message(F.text == B_POINTS)
 async def points(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("📍 <b>Наші точки</b>\n" + "\n".join(f"• {p}" for p in POINTS) +
-                   "\n\nШтампи й подарунки діють на всіх точках.")
+    await m.answer(points_text())
+
+
+@router.message(F.text == B_MENU_ORDER)
+async def order_menu(m: Message, state: FSMContext):
+    await state.clear()
+    u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    rows = []
+    last = u.get("last")
+    if last:
+        rows.append([InlineKeyboardButton(text=f"🔁 Як завжди: {DRINKS[last['drink']][0]}", callback_data="mn:usual")])
+    rows.append([InlineKeyboardButton(text="🆕 Нове замовлення", callback_data="mn:new")])
+    rows.append([InlineKeyboardButton(text="✍️ Вподобання" + (" ✓" if u.get("prefs") else ""), callback_data="mn:prefs")])
+    await m.answer("☕ Що робимо?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(F.text == B_INFO)
+async def info_menu(m: Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📍 Наші точки", callback_data="mn:points")],
+        [InlineKeyboardButton(text="⭐ Залишити відгук", callback_data="mn:review")]])
+    await m.answer("Що показати?", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("mn:"))
+async def menu_cb(c: CallbackQuery, state: FSMContext):
+    act = c.data[3:]
+    if act == "usual":
+        await show_usual(c.message, c.from_user)
+    elif act == "new":
+        await show_drinks(c.message)
+    elif act == "prefs":
+        await ask_prefs(c.message, c.from_user, state)
+    elif act == "points":
+        await c.message.answer(points_text())
+    elif act == "review":
+        await show_rating(c.message)
+    await c.answer()
 
 
 # --- предзамовлення ---
+async def show_drinks(msg: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"od:{i}")] for i, (n, p) in enumerate(DRINKS)])
+    await msg.answer("Що замовити?", reply_markup=kb)
+
+
 @router.message(F.text == B_ORDER)
 async def order_start(m: Message, state: FSMContext):
     await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"od:{i}")] for i, (n, p) in enumerate(DRINKS)])
-    await m.answer("Що замовити?", reply_markup=kb)
+    await show_drinks(m)
 
 
 @router.callback_query(F.data.startswith("od:"))
@@ -306,7 +366,11 @@ async def order_done(c: CallbackQuery, bot: Bot):
 @router.message(F.text == B_USUAL)
 async def usual_start(m: Message, state: FSMContext):
     await state.clear()
-    u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    await show_usual(m, m.from_user)
+
+
+async def show_usual(m: Message, user):
+    u, _ = st.ensure(user.id, user.full_name)
     last = u.get("last")
     if not last:
         await m.answer(f"Ви ще нічого не замовляли. Зробіть перше замовлення через «{B_ORDER}» — "
@@ -333,7 +397,11 @@ async def usual_go(c: CallbackQuery, bot: Bot):
 
 @router.message(F.text == B_PREFS)
 async def prefs_start(m: Message, state: FSMContext):
-    u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    await ask_prefs(m, m.from_user, state)
+
+
+async def ask_prefs(m: Message, user, state: FSMContext):
+    u, _ = st.ensure(user.id, user.full_name)
     await state.set_state(Prefs.text)
     cur = f"\nЗараз: <b>{esc(u['prefs'])}</b>" if u.get("prefs") else ""
     await m.answer("✍️ Напишіть, як ви любите каву — бариста побачить це в кожному вашому замовленні.\n"
@@ -359,7 +427,8 @@ async def passport(m: Message, state: FSMContext):
     have, left = st.passport_state(u)
     rows = "\n".join(f"{'✅' if p in have else '⬜'} {esc(p)}" for p in POINTS)
     tail = (f"Лишилось днів: <b>{left}</b>." if have else f"Відвідайте всі точки за {PASSPORT_DAYS} днів.")
-    caption = (f"🧭 <b>Кавовий паспорт</b>\nКав'ярня й обидві будки за {PASSPORT_DAYS} днів — напій у подарунок.\n\n"
+    caption = (f"🧭 <b>Кавовий паспорт</b>\nКав'ярня й обидві будки за {PASSPORT_DAYS} днів — подарунок: "
+               f"<b>{esc(st.reward_title('passport', u))}</b>.\n\n"
                f"{rows}\n{tail}\n\n📲 Покажіть цей QR бариста на касі.\n"
                f"Якщо не зчитується — назвіть код: <code>{u['code']}</code>")
     try:
@@ -392,8 +461,12 @@ async def order_ready(c: CallbackQuery, bot: Bot):
 @router.message(F.text == B_REVIEW)
 async def review_start(m: Message, state: FSMContext):
     await state.clear()
+    await show_rating(m)
+
+
+async def show_rating(m: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⭐" * s if s > 1 else "⭐", callback_data=f"rv:{s}") for s in range(1, 6)]])
+        InlineKeyboardButton(text=f"{n}⭐", callback_data=f"rv:{n}") for n in range(1, 6)]])
     await m.answer("Як вам візит? Оцініть від 1 до 5 ⭐", reply_markup=kb)
 
 
@@ -545,46 +618,52 @@ async def apply_stamp(bot: Bot, me, k, u):
     gift = u["stamps"] >= STAMPS_FOR_GIFT
     if gift:
         u["stamps"] = 0
-        u["gifts"] += 1
+        st.grant(u, "stamps")
     passed = st.passport_mark(u, point)
     st.log_visit(point)
     st.save()
+    g_stamps = esc(st.reward_title("stamps", u))
+    g_pass = esc(st.reward_title("passport", u))
     if not u.get("demo"):
         txt = f"☕ +1 штамп ({esc(point)})!\n{bar(u['stamps'])}  {u['stamps']}/{STAMPS_FOR_GIFT}"
         if gift:
-            txt = "🎉 Ви назбирали безкоштовний напій! Покажіть QR бариста."
+            txt = f"🎉 {STAMPS_FOR_GIFT} штампів! Ваш подарунок: <b>{g_stamps}</b>. Покажіть QR бариста."
         if passed:
-            txt += "\n🧭 Кавовий паспорт пройдено: усі точки за тиждень — вам ще один подарунок!"
+            txt += f"\n🧭 Паспорт пройдено — подарунок: <b>{g_pass}</b>!"
         else:
             have, _left = st.passport_state(u)
             txt += f"\n🧭 Паспорт: {len(have)}/{len(POINTS)} точок"
         await safe_send(bot, int(k), txt)
     return (f"✅ Штамп додано: {esc(u['name'])} · {esc(point)}\n{bar(u['stamps'])} {u['stamps']}/{STAMPS_FOR_GIFT}"
-            + ("\n🎉 Набрано подарунок!" if gift else "")
-            + ("\n🧭 Паспорт пройдено — ще один подарунок!" if passed else ""))
+            + (f"\n🎉 Подарунок за штампи: {g_stamps}" if gift else "")
+            + (f"\n🧭 Паспорт пройдено — подарунок: {g_pass}" if passed else ""))
 
 
-async def apply_redeem(bot: Bot, k, u):
-    if not u["gifts"]:
-        return f"У {esc(u['name'])} немає подарунків."
-    u["gifts"] -= 1
+async def apply_redeem(bot: Bot, k, u, goal=None):
+    g = st.take(u, goal) if goal else (u["gifts"].pop(0) if u["gifts"] else None)
+    if not g:
+        return f"У {esc(u['name'])} немає такого подарунка."
     st.save()
+    title = esc(st.reward_title(g["goal"], u))
     if not u.get("demo"):
-        await safe_send(bot, int(k), "🎁 Подарунок отримано. Смачної кави! ☕")
-    return f"🎁 Подарунок погашено: {esc(u['name'])}. Лишилось: {u['gifts']}."
+        await safe_send(bot, int(k), f"🎁 Видано: <b>{title}</b>. Смачного! ☕")
+    return f"🎁 Видано: {title} → {esc(u['name'])}. Лишилось подарунків: {len(u['gifts'])}."
 
 
 async def show_client_card(m: Message, k, u):
     """Картка клієнта після скану QR: бариста сам обирає дію, тож повторний скан не дає подвійного штампа."""
     have, _ = st.passport_state(u)
     text = (f"👤 <b>{esc(u['name'])}</b>\n{bar(u['stamps'])} {u['stamps']}/{STAMPS_FOR_GIFT}\n"
-            f"🎁 Подарунків: {u['gifts']}\n🧭 Паспорт: {len(have)}/{len(POINTS)} точок")
-    if u.get("prefs"):
-        text += f"\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
-    point = st.user(m.from_user.id).get("point", POINTS[0])
-    rows = [[InlineKeyboardButton(text=f"➕ Штамп ({point})", callback_data=f"cs:{st.token(u)}")]]
+            f"🧭 Паспорт: {len(have)}/{len(POINTS)} точок")
     if u["gifts"]:
-        rows.append([InlineKeyboardButton(text="🎁 Погасити подарунок", callback_data=f"cg:{st.token(u)}")])
+        text += f"\n\n🎁 <b>Подарунки</b>\n{gift_lines(u)}"
+    if u.get("prefs"):
+        text += f"\n\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
+    point = st.user(m.from_user.id).get("point", POINTS[0])
+    tok = st.token(u)
+    rows = [[InlineKeyboardButton(text=f"➕ Штамп ({point})", callback_data=f"cs:{tok}")]]
+    for goal in dict.fromkeys(g["goal"] for g in u["gifts"]):
+        rows.append([InlineKeyboardButton(text=f"🎁 Видати: {st.reward_title(goal, u)}"[:60], callback_data=f"cg:{tok}:{goal}")])
     await m.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -593,13 +672,13 @@ async def card_action(c: CallbackQuery, bot: Bot):
     if not can_owner(c.from_user.id):
         await c.answer("Недоступно", show_alert=True)
         return
-    act, tok = c.data.split(":", 1)
+    act, tok, *rest = c.data.split(":")
     k, u = st.by_token(tok)
     if not u:
         await c.answer("Клієнта не знайдено", show_alert=True)
         return
     me, _ = st.ensure(c.from_user.id, c.from_user.full_name)
-    res = await (apply_stamp(bot, me, k, u) if act == "cs" else apply_redeem(bot, k, u))
+    res = await (apply_stamp(bot, me, k, u) if act == "cs" else apply_redeem(bot, k, u, rest[0] if rest else None))
     await c.message.edit_text(c.message.html_text + "\n\n" + res)
     await c.answer()
 
@@ -628,7 +707,43 @@ async def redeem_code(m: Message, state: FSMContext, bot: Bot):
         await m.answer("Такого коду немає.")
         return
     await state.clear()
-    await m.answer(await apply_redeem(bot, k, u))
+    await show_client_card(m, k, u)
+
+
+@router.message(F.text == O_REWARDS, owner_only)
+async def rewards_menu(m: Message, state: FSMContext):
+    await state.clear()
+    rows = [[InlineKeyboardButton(text=f"{GOAL_NAMES[g]}: {st.d['rewards'][g]}"[:60], callback_data=f"rw:{g}")]
+            for g in ("passport", "stamps", "welcome")]
+    await m.answer("🎁 <b>Нагороди за цілі</b>\nОберіть, що змінити. На кнопці — поточна нагорода.",
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("rw:"))
+async def rewards_pick(c: CallbackQuery, state: FSMContext):
+    if not can_owner(c.from_user.id):
+        await c.answer("Недоступно", show_alert=True)
+        return
+    goal = c.data[3:]
+    await state.set_state(Reward.text)
+    await state.update_data(goal=goal)
+    hint = "\nМожна використати {usual} — підставиться улюблений напій клієнта." if goal == "stamps" else ""
+    await c.message.answer(f"Ціль: <b>{GOAL_NAMES[goal]}</b>\nЗараз: <b>{esc(st.d['rewards'][goal])}</b>\n"
+                           f"Напишіть нову нагороду одним повідомленням.{hint}")
+    await c.answer()
+
+
+@router.message(Reward.text, ~F.text.in_(ALL_BTNS))
+async def rewards_save(m: Message, state: FSMContext):
+    goal = (await state.get_data()).get("goal")
+    await state.clear()
+    text = (m.text or "").strip()[:80]
+    if goal not in GOAL_NAMES or not text:
+        await m.answer("Не вдалося зберегти, спробуйте ще раз.")
+        return
+    st.d["rewards"][goal] = text
+    st.save()
+    await m.answer(f"✅ Нагорода за «{GOAL_NAMES[goal]}»: <b>{esc(text)}</b>\nКлієнти побачать її одразу.")
 
 
 @router.message(F.text == O_REPORT, owner_only)

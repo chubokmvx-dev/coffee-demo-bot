@@ -8,14 +8,26 @@ STAMPS_FOR_GIFT = 8
 PASSPORT_DAYS = 7
 POINTS = ["Кав'ярня", "Будка №1", "Будка №2"]
 DAY = 86400
+DRINKS_NAMES = ["Еспресо", "Американо", "Капучино", "Лате"]
 TZ = ZoneInfo("Europe/Kyiv")
+DEFAULT_REWARDS = {
+    "welcome": "Безкоштовний напій до першої кави",
+    "stamps": "Безкоштовна кава «як завжди» ({usual})",
+    "passport": "Круасан",
+}
+GOAL_NAMES = {
+    "welcome": "вітальний подарунок",
+    "stamps": f"{STAMPS_FOR_GIFT} штампів",
+    "passport": f"паспорт: {len(POINTS)} точки за {PASSPORT_DAYS} днів",
+}
 WD = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
 WD_ACC = ["понеділок", "вівторок", "середу", "четвер", "п'ятницю", "суботу", "неділю"]
 
 
 def _empty():
     return {"users": {}, "orders": {}, "next_order": 1, "seeded": False, "promos": 0, "reviews": [],
-            "log": [], "scheduled": [], "weekly_sent": "", "seeded_log": False}
+            "log": [], "scheduled": [], "weekly_sent": "", "seeded_log": False,
+            "rewards": dict(DEFAULT_REWARDS)}
 
 
 class Store:
@@ -28,6 +40,11 @@ class Store:
             self.d = _empty()
         for k, v in _empty().items():
             self.d.setdefault(k, v)
+        for k, v in DEFAULT_REWARDS.items():
+            self.d["rewards"].setdefault(k, v)
+        for u in self.d["users"].values():     # міграція: раніше подарунки були числом
+            if isinstance(u.get("gifts"), int):
+                u["gifts"] = [{"goal": "welcome"} for _ in range(u["gifts"])]
         if not self.d["seeded"]:
             self._seed()
         if not self.d["seeded_log"]:
@@ -49,7 +66,7 @@ class Store:
             gone = rnd.random() < 0.3
             self.d["users"][uid] = {
                 "name": f"Демо-клієнт {i + 1}", "phone": None, "demo": True,
-                "stamps": rnd.randint(0, 7), "gifts": 0, "mode": "client",
+                "stamps": rnd.randint(0, 7), "gifts": [], "mode": "client",
                 "joined": now - rnd.randint(10, 90) * DAY,
                 "last_visit": now - (rnd.randint(22, 60) if gone else rnd.randint(0, 14)) * DAY,
                 "code": f"9{i:03d}",
@@ -82,7 +99,7 @@ class Store:
             return u, False
         used = {x["code"] for x in self.d["users"].values()}
         code = next(c for c in (f"{random.randint(100000, 899999)}" for _ in range(10_000)) if c not in used)
-        u = {"name": name, "phone": None, "demo": False, "stamps": 0, "gifts": 1, "mode": "client",
+        u = {"name": name, "phone": None, "demo": False, "stamps": 0, "gifts": [{"goal": "welcome"}], "mode": "client",
              "joined": time.time(), "last_visit": time.time(), "code": code, "owner_ok": False,
              "point": POINTS[0], "pass": {}, "last": None, "prefs": "", "token": secrets.token_urlsafe(8)}
         self.d["users"][str(uid)] = u
@@ -127,6 +144,25 @@ class Store:
         self.save()
         return n
 
+    # --- подарунки та нагороди ---
+    def reward_title(self, goal, u=None):
+        """Поточна нагорода за ціль. {usual} → напій «як завжди» клієнта."""
+        text = self.d["rewards"].get(goal, DEFAULT_REWARDS.get(goal, "Подарунок"))
+        usual = "напій на вибір"
+        last = (u or {}).get("last")
+        if last:
+            usual = DRINKS_NAMES[last["drink"]] if last["drink"] < len(DRINKS_NAMES) else usual
+        return text.replace("{usual}", usual)
+
+    def grant(self, u, goal):
+        u["gifts"].append({"goal": goal})
+
+    def take(self, u, goal):
+        for i, g in enumerate(u["gifts"]):
+            if g["goal"] == goal:
+                return u["gifts"].pop(i)
+        return None
+
     # --- паспорт ---
     def passport_state(self, u):
         lim = time.time() - PASSPORT_DAYS * DAY
@@ -142,7 +178,7 @@ class Store:
         have[point] = time.time()
         if all(p in have for p in POINTS):
             u["pass"] = {}
-            u["gifts"] += 1
+            u["gifts"].append({"goal": "passport"})
             return True
         u["pass"] = have
         return False
