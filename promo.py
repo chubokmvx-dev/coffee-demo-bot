@@ -74,3 +74,44 @@ def render(text: str, shop: str) -> bytes:
     buf = BytesIO()
     img.save(buf, "JPEG", quality=92)
     return buf.getvalue()
+
+
+def render_coupon(title: str, shop: str, qr_png: bytes, valid: str) -> bytes:
+    """Персональний купон: що саме в подарунок, QR для бариста й термін дії."""
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.text((M, M), shop.upper(), font=_font(True, 30), fill=INK)
+    _cup(d, W - M - 140, M - 6, 110)
+    d.rectangle((M, 190, M + 72, 196), fill=ACCENT)
+    d.text((M, 230), "ПОДАРУНОК", font=_font(True, 28), fill=ACCENT)
+    head, sub = split_text(title)
+    if sub.lower().startswith("покажіть"):
+        sub = ""                                  # QR уже каже «покажіть бариста»
+    max_w = W - 2 * M
+    for size in range(76, 36, -4):
+        f = _font(True, size)
+        lines = _wrap(d, head, f, max_w)
+        if len(lines) <= 3 and all(d.textlength(l, font=f) <= max_w for l in lines):
+            break
+    y, lh = 285, int(size * 1.14)
+    for l in lines[:3]:
+        d.text((M, y), l, font=f, fill=INK)
+        y += lh
+    sf = _font(False, 34)
+    for l in (_wrap(d, sub, sf, max_w)[:2] if sub else []):
+        d.text((M, y + 10), l, font=sf, fill=MUTED)
+        y += 46
+    qr = Image.open(BytesIO(qr_png)).convert("RGB")
+    side = 400
+    qr = qr.resize((side, side), Image.NEAREST)
+    qx, qy = M, H - M - side
+    d.rounded_rectangle((qx - 18, qy - 18, qx + side + 18, qy + side + 18), radius=24, fill=(255, 255, 255))
+    img.paste(qr, (qx, qy))
+    tx = qx + side + 50
+    d.text((tx, qy + 20), "Покажіть QR", font=_font(True, 36), fill=INK)
+    d.text((tx, qy + 66), "бариста на касі", font=_font(False, 34), fill=MUTED)
+    d.text((tx, qy + side - 90), f"Діє {valid}" if valid != "безстроково" else "Безстроково", font=_font(True, 34), fill=ACCENT)
+    d.text((tx, qy + side - 44), "Одноразовий", font=_font(False, 30), fill=MUTED)
+    buf = BytesIO()
+    img.save(buf, "JPEG", quality=92)
+    return buf.getvalue()

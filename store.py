@@ -28,6 +28,9 @@ DEFAULT_SETTINGS = {
     "weekly_on": True,
     "welcome_on": True,
     "promo_photo": True,
+    "gift_valid_days": 60,      # скільки днів діє подарунок (0 — безстроково)
+    "promo_valid_days": 7,      # скільки днів діє купон з акції / повернення
+    "backup_on": True,          # щодобовий файл-копія бази власнику в Telegram
     "order_max_active": 1,      # скільки незабраних замовлень одночасно може мати клієнт
     "noshow_limit": 3,          # після скількох «не забрали» за 30 днів передзамовлення вимикаються (0 — не обмежувати)
     "alert_stamps_hour": 12,    # сповіщення власнику, якщо один бариста поставив стільки штампів за годину (0 — вимкнено)
@@ -77,6 +80,11 @@ class Store:
         for u in self.d["users"].values():     # міграція: раніше подарунки були числом
             if isinstance(u.get("gifts"), int):
                 u["gifts"] = [{"goal": "welcome"} for _ in range(u["gifts"])]
+        for u in self.d["users"].values():     # міграція: кожен подарунок отримує id і термін дії
+            for g in u.get("gifts", []):
+                if "id" not in g:
+                    g["id"] = secrets.token_urlsafe(6)
+                    g["exp"] = self._exp(g["goal"])
         if not self.d["seeded"]:
             self._seed()
         if not self.d["seeded_log"]:
@@ -90,7 +98,8 @@ class Store:
         return {"welcome": "вітальний подарунок",
                 "stamps": f"{self.cfg('stamps_goal')} штампів",
                 "passport": f"паспорт: {len(self.cfg('points'))} точки за {self.cfg('passport_days')} днів",
-                "referral": "запрошення друга", "birthday": "день народження"}[goal]
+                "referral": "запрошення друга", "birthday": "день народження",
+                "promo": "акція", "winback": "повернення"}.get(goal, "подарунок")
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -140,10 +149,12 @@ class Store:
             return u, False
         used = {x["code"] for x in self.d["users"].values()}
         code = next(c for c in (f"{random.randint(100000, 899999)}" for _ in range(10_000)) if c not in used)
-        u = {"name": name, "phone": None, "demo": False, "stamps": 0, "gifts": [{"goal": "welcome"}] if self.cfg("welcome_on") else [], "mode": "client",
+        u = {"name": name, "phone": None, "demo": False, "stamps": 0, "gifts": [], "mode": "client",
              "joined": time.time(), "last_visit": time.time(), "code": code, "owner_ok": False,
              "point": self.cfg("points")[0], "pass": {}, "last": None, "prefs": "", "token": secrets.token_urlsafe(8)}
         self.d["users"][str(uid)] = u
+        if self.cfg("welcome_on"):
+            self.grant(u, "welcome")
         self.save()
         return u, True
 
@@ -258,14 +269,58 @@ class Store:
             usual = names[last["drink"]]
         return text.replace("{usual}", usual)
 
-    def grant(self, u, goal):
-        u["gifts"].append({"goal": goal})
+    def _exp(self, goal):
+        days = self.cfg("promo_valid_days") if goal in ("promo", "winback") else self.cfg("gift_valid_days")
+        return time.time() + days * DAY if days else None
 
-    def take(self, u, goal):
-        for i, g in enumerate(u["gifts"]):
-            if g["goal"] == goal:
-                return u["gifts"].pop(i)
+    def grant(self, u, goal, title=None):
+        """Новий подарунок з унікальним id (для QR-купона) і терміном дії. Повертає його."""
+        g = {"goal": goal, "id": secrets.token_urlsafe(6), "exp": self._exp(goal)}
+        if title:
+            g["title"] = title
+        u["gifts"].append(g)
+        return g
+
+    def live(self, u):
+        now = time.time()
+        return [g for g in u["gifts"] if not g.get("exp") or g["exp"] > now]
+
+    def gift_title(self, g, u=None):
+        return g.get("title") or self.reward_title(g["goal"], u)
+
+    def exp_text(self, g):
+        return f"до {datetime.fromtimestamp(g['exp'], TZ):%d.%m}" if g.get("exp") else "безстроково"
+
+    def take(self, u, key):
+        """Забирає подарунок за id купона або за назвою цілі (перший чинний)."""
+        for g in self.live(u):
+            if g.get("id") == key or g["goal"] == key:
+                u["gifts"].remove(g)
+                return g
         return None
+
+    def find_gift(self, gid):
+        for k, u in self.d["users"].items():
+            for g in self.live(u):
+                if g.get("id") == gid:
+                    return k, u, g
+        return None, None, None
+
+    def sweep_gifts(self):
+        """Прибирає прострочені подарунки; повертає (скільки прибрано, [(k, u, g)] що спливають за ≤3 дні, ще без нагадування)."""
+        now, soon, gone = time.time(), [], 0
+        for k, u in self.d["users"].items():
+            keep = []
+            for g in u["gifts"]:
+                if g.get("exp") and g["exp"] <= now:
+                    gone += 1
+                    continue
+                if g.get("exp") and g["exp"] - now <= 3 * DAY and not g.get("warned") and not u.get("demo"):
+                    g["warned"] = True
+                    soon.append((k, u, g))
+                keep.append(g)
+            u["gifts"] = keep
+        return gone, soon
 
     # --- паспорт ---
     def passport_state(self, u):
@@ -283,7 +338,7 @@ class Store:
         have[point] = time.time()
         if all(p in have for p in self.cfg("points")):
             u["pass"] = {}
-            u["gifts"].append({"goal": "passport"})
+            self.grant(u, "passport")
             return True
         u["pass"] = have
         return False

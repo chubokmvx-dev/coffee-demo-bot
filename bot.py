@@ -186,6 +186,49 @@ def client_link(u):
     return f"https://t.me/{BOT_USERNAME}?start=c_{st.token(u)}"
 
 
+def coupon_link(g):
+    return f"https://t.me/{BOT_USERNAME}?start=g_{g['id']}"
+
+
+def coupon_png(u, g):
+    return promo_img.render_coupon(st.gift_title(g, u), shop(), qr_png(coupon_link(g)), st.exp_text(g))
+
+
+async def send_coupon(bot, chat_id, u, g, intro=""):
+    """Купон-картинка з QR; якщо не вдалось намалювати — текст."""
+    cap = f"{intro}🎟 <b>{esc(st.gift_title(g, u))}</b>\nДіє {st.exp_text(g)} · одноразовий. Покажіть QR бариста."
+    try:
+        png = coupon_png(u, g)
+        await bot.send_photo(chat_id, BufferedInputFile(png, filename="coupon.jpg"), caption=cap)
+        return True
+    except TelegramAPIError as e:
+        log.warning("coupon to %s failed: %s", chat_id, e)
+        return False
+    except Exception:
+        log.exception("coupon image")
+        return await safe_send(bot, chat_id, cap + f"\nКупон також у «{B_GIFTS}».")
+
+
+async def give_promo(bot, uid, u, goal, title, text, png=None):
+    """Одноразовий купон на акцію/повернення: гарантує, що акція не діє «безкінечно» й не копіюється."""
+    if any(g["goal"] == goal and g.get("title") == title for g in st.live(u)):
+        return False                                    # такий купон у клієнта вже є — не дублюємо
+    g = st.grant(u, goal, title)
+    st.save()
+    if st.cfg("promo_photo") and await send_coupon(bot, uid, u, g):
+        return True
+    return await safe_send(bot, uid, f"{esc(text)}\n\n🎟 Купон з QR — у «{B_GIFTS}». Діє {st.exp_text(g)}.")
+
+
+async def blast(bot, text):
+    sent = 0
+    for uid, u in st.real():
+        if await give_promo(bot, uid, u, "promo", text[:150], text):
+            sent += 1
+        await asyncio.sleep(0.05)
+    return sent
+
+
 def touch(uid):
     u = st.user(uid)
     if u:
@@ -233,6 +276,22 @@ async def start(m: Message, state: FSMContext, command: CommandObject):
             return
         await m.answer("Цей QR не розпізнано.")
         return
+    if arg.startswith("g_"):
+        k, owner_u, g = st.find_gift(arg[2:])
+        if not g:
+            await m.answer("Цей купон уже використано, він прострочений або недійсний.")
+            return
+        if can_staff(uid):
+            st.ensure(uid, m.from_user.full_name)[0]["mode"] = "owner" if can_owner(uid) else "barista"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="🎁 Видати", callback_data=f"cg:{st.token(owner_u)}:{g['id']}")]])
+            await m.answer("🧾 Купон клієнта", reply_markup=staff_kb(uid))
+            await m.answer(f"🎟 <b>{esc(st.gift_title(g, owner_u))}</b>\n👤 {esc(owner_u['name'])} · діє {st.exp_text(g)}", reply_markup=kb)
+        elif str(uid) == k:
+            await send_coupon(_BOT or m.bot, uid, owner_u, g)
+        else:
+            await m.answer("Цей купон належить іншому клієнту.")
+        return
     if arg.startswith("b_"):
         ts = st.d["invites"].pop(arg[2:], None)
         if ts and time.time() - ts < 48 * 3600:
@@ -260,7 +319,9 @@ async def start(m: Message, state: FSMContext, command: CommandObject):
             f"Привіт, {esc(m.from_user.first_name)}! ☕\n"
             + (f"Вас запросив(ла) {esc(st.user(u['ref'])['name'])}. Після вашого першого штампа ви обоє отримаєте подарунок.\n" if invited else "")
             +
-            f"Це бот «{esc(shop())}». Ми вже додали вам <b>подарунок</b>: {esc(st.reward_title('welcome'))}.\n\n"
+            f"Це бот «{esc(shop())}». "
+            + (f"Вітальний подарунок: <b>{esc(st.reward_title('welcome'))}</b> — купон з QR у «{B_GIFTS}».\n\n" if st.cfg("welcome_on") else "\n")
+            + f""
             f"Збирайте штампи: кожен {goal_n()}-й напій у подарунок. "
             f"Штампи працюють у кав'ярні та на всіх будках.",
             reply_markup=client_kb(uid))
@@ -347,7 +408,7 @@ async def my_stamps(m: Message, state: FSMContext):
 
 
 def gift_lines(u):
-    return "\n".join(f"• <b>{esc(st.reward_title(g['goal'], u))}</b> — {st.goal_name(g['goal'])}" for g in u["gifts"])
+    return "\n".join(f"• <b>{esc(st.gift_title(g, u))}</b> — {st.exp_text(g)}" for g in st.live(u))
 
 
 @router.message(F.text == B_GIFTS)
@@ -358,10 +419,24 @@ async def my_gifts(m: Message, state: FSMContext):
     goals = (f"🎯 <b>Як отримати подарунок</b>\n"
              f"☕ {goal_n()} штампів ({u['stamps']}/{goal_n()}) → {esc(st.reward_title('stamps', u))}\n"
              f"🧭 Паспорт ({len(have)}/{len(points())} точок за {pdays()} днів) → {esc(st.reward_title('passport', u))}")
-    if u["gifts"]:
-        await m.answer(f"🎁 <b>Ваші подарунки</b>\n{gift_lines(u)}\n\nПокажіть QR із «{B_PASS}» бариста, щоб забрати.\n\n{goals}")
+    if st.live(u):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎟 {st.gift_title(g, u)}"[:60], callback_data=f"gc:{g['id']}")] for g in st.live(u)][:8])
+        await m.answer(f"🎁 <b>Ваші подарунки</b>\n{gift_lines(u)}\n\nНатисніть, щоб відкрити купон із QR для бариста.\n\n{goals}",
+                       reply_markup=kb)
     else:
         await m.answer(f"Подарунків поки немає.\n\n{goals}")
+
+
+@router.callback_query(F.data.startswith("gc:"))
+async def coupon_show(c: CallbackQuery, bot: Bot):
+    u, _ = st.ensure(c.from_user.id, c.from_user.full_name)
+    g = next((x for x in st.live(u) if x["id"] == c.data[3:]), None)
+    if not g:
+        await c.answer("Цей купон уже використано або він прострочений.", show_alert=True)
+        return
+    await send_coupon(bot, c.from_user.id, u, g)
+    await c.answer()
 
 
 def points_text():
@@ -987,9 +1062,16 @@ async def promo_preview(msg: Message, state: FSMContext, text: str):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Надіслати", callback_data="ps"),
                                                 InlineKeyboardButton(text="Скасувати", callback_data="px")]])
     info = f"Отримувачів: {real} у боті + {st.demo_count()} у демо-базі."
-    png = promo_png(text)
+    png = None
+    if st.cfg("promo_photo"):
+        try:
+            png = promo_img.render_coupon(text[:150], shop(), qr_png(f"https://t.me/{BOT_USERNAME}?start=g_demo"),
+                                          f"до {(datetime.now(TZ) + timedelta(days=st.cfg('promo_valid_days'))):%d.%m}")
+        except Exception:
+            log.exception("coupon preview")
     if png:
-        await msg.answer_photo(BufferedInputFile(png, filename="promo.jpg"), caption=f"{esc(text)}\n\n{info}"[:1000], reply_markup=kb)
+        await msg.answer_photo(BufferedInputFile(png, filename="coupon.jpg"),
+                               caption=f"Так побачить клієнт: особистий купон із QR, одноразовий.\n\n{info}"[:1000], reply_markup=kb)
     else:
         await msg.answer(f"Так побачать клієнти:\n\n{esc(text)}\n\n{info}", reply_markup=kb)
 
@@ -1003,16 +1085,12 @@ async def promo_send(c: CallbackQuery, state: FSMContext, bot: Bot):
     if not text:
         await c.answer("Немає тексту, почніть спочатку", show_alert=True)
         return
-    sent = 0
-    png = promo_png(text)
-    for uid, _ in st.real():
-        if await send_promo(bot, uid, text, png):
-            sent += 1
-        await asyncio.sleep(0.05)
+    sent = await blast(bot, text)
     st.d["promos"] = st.d.get("promos", 0) + 1
     st.save()
     await state.clear()
     done = (f"✅ Надіслано: {sent} реальним підписникам (+ {st.demo_count()} у демо-базі умовно).\n"
+            f"Кожен отримав одноразовий купон на {st.cfg('promo_valid_days')} дн. — повторно використати його не вийде.\n"
             f"Результат дивіться у «{O_REPORT}»: продажі 11–14 до і після.")
     if c.message.photo:
         await c.message.edit_caption(caption=done)
@@ -1031,13 +1109,16 @@ async def promo_cancel(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
+WB_TITLE = "Кава за наш рахунок"
+
+
 @router.message(F.text == O_BACK, owner_only)
 async def win_back(m: Message, state: FSMContext):
     await state.clear()
     gone = st.inactive(21)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📨 Надіслати «Скучили»", callback_data="wb")]])
     await m.answer(f"💤 Не були 3+ тижні: <b>{len(gone)}</b> клієнтів.\nБот напише кожному: "
-                   f"«Скучили! Кава за наш рахунок, діє 7 днів».", reply_markup=kb)
+                   f"особистий одноразовий купон «{WB_TITLE}» на {st.cfg('promo_valid_days')} днів.", reply_markup=kb)
 
 
 @router.callback_query(F.data == "wb")
@@ -1047,10 +1128,15 @@ async def win_back_send(c: CallbackQuery, bot: Bot):
         return
     gone = st.inactive(21)
     real_gone = [(i, u) for i, u in gone if not u.get("demo")]
-    for i, _ in real_gone:
-        await safe_send(bot, i, "Скучили за вами! ☕ Кава за наш рахунок — діє 7 днів. Покажіть це повідомлення.")
+    for i, u in real_gone:
+        await give_promo(bot, i, u, "winback", WB_TITLE, "Скучили за вами! ☕")
     # приклад для власника: що саме побачить такий клієнт
-    await safe_send(bot, c.from_user.id, "👀 Так це побачить клієнт:\n\nСкучили за вами! ☕ Кава за наш рахунок — діє 7 днів. Покажіть це повідомлення.")
+    try:
+        png = promo_img.render_coupon(WB_TITLE, shop(), qr_png(f"https://t.me/{BOT_USERNAME}?start=g_demo"),
+                                      f"до {(datetime.now(TZ) + timedelta(days=st.cfg('promo_valid_days'))):%d.%m}")
+        await bot.send_photo(c.from_user.id, BufferedInputFile(png, filename="coupon.jpg"), caption="👀 Так це побачить клієнт")
+    except Exception:
+        log.exception("wb preview")
     await c.message.edit_text(f"✅ Відправлено: {len(gone)} клієнтам (реальних у боті: {len(real_gone)}, решта — демо-база).")
     await c.answer()
 
@@ -1127,7 +1213,7 @@ async def apply_stamp(bot: Bot, me, k, u, by=None):
     gift = u["stamps"] >= goal_n()
     if gift:
         u["stamps"] = 0
-        st.grant(u, "stamps")
+        gg = st.grant(u, "stamps")
     passed = st.passport_mark(u, point)
     st.log_visit(point)
     st.log_action("stamp", by, k, point, f"від {min_check()}" if st.cfg("stamp_confirm") else "")
@@ -1139,13 +1225,15 @@ async def apply_stamp(bot: Bot, me, k, u, by=None):
     if not u.get("demo"):
         txt = f"☕ +1 штамп ({esc(point)})!\n{bar(u['stamps'])}  {u['stamps']}/{goal_n()}"
         if gift:
-            txt = f"🎉 {goal_n()} штампів! Ваш подарунок: <b>{g_stamps}</b>. Покажіть QR бариста."
+            txt = f"🎉 {goal_n()} штампів! Ваш подарунок: <b>{g_stamps}</b>. Купон з QR — у «{B_GIFTS}»."
         if passed:
             txt += f"\n🧭 Паспорт пройдено — подарунок: <b>{g_pass}</b>!"
         else:
             have, _left = st.passport_state(u)
             txt += f"\n🧭 Паспорт: {len(have)}/{len(points())} точок"
         await safe_send(bot, int(k), txt)
+        if gift:
+            await send_coupon(bot, int(k), u, gg)
     return (f"✅ Штамп додано: {esc(u['name'])} · {esc(point)}\n{bar(u['stamps'])} {u['stamps']}/{goal_n()}"
             + (f"\n🎉 Подарунок за штампи: {g_stamps}" if gift else "")
             + (f"\n🧭 Паспорт пройдено — подарунок: {g_pass}" if passed else "")
@@ -1179,31 +1267,32 @@ async def pay_referral(bot: Bot, k, u):
     if not rk_ or u.get("ref_paid") or not st.cfg("ref_on"):
         return ""
     u["ref_paid"] = True
-    st.grant(u, "referral")
+    gu = st.grant(u, "referral")
     note = "\n👥 Друг, якого запросили: подарунок нараховано."
     ref = st.user(rk_)
     if ref and ref.get("ref_count", 0) < st.cfg("ref_max"):
         ref["ref_count"] = ref.get("ref_count", 0) + 1
-        st.grant(ref, "referral")
-        await safe_send(bot, int(rk_), f"👥 Ваш друг зробив перший візит! Подарунок: <b>{esc(st.reward_title('referral', ref))}</b>. "
-                                       f"Покажіть QR бариста.")
+        gr = st.grant(ref, "referral")
+        st.save()
+        await send_coupon(bot, int(rk_), ref, gr, intro="👥 Ваш друг зробив перший візит!\n")
         note = "\n👥 Запрошення: подарунок нараховано другу й тому, хто запросив."
     if not u.get("demo"):
-        await safe_send(bot, int(k), f"🎁 Подарунок за запрошення: <b>{esc(st.reward_title('referral', u))}</b>.")
+        await send_coupon(bot, int(k), u, gu, intro="🎁 Подарунок за запрошення.\n")
     return note
 
 
 async def apply_redeem(bot: Bot, k, u, goal=None, by=None, point=None):
-    g = st.take(u, goal) if goal else (u["gifts"].pop(0) if u["gifts"] else None)
+    live = st.live(u)
+    g = st.take(u, goal) if goal else (st.take(u, live[0]["id"]) if live else None)
     if not g:
-        return f"У {esc(u['name'])} немає такого подарунка."
+        return f"У {esc(u['name'])} немає такого чинного подарунка (можливо, уже видано чи прострочено)."
     st.log_action("redeem", by, k, point, g["goal"])
     st.save()
     await check_anomaly(bot, by)
-    title = esc(st.reward_title(g["goal"], u))
+    title = esc(st.gift_title(g, u))
     if not u.get("demo"):
         await safe_send(bot, int(k), f"🎁 Видано: <b>{title}</b>. Смачного! ☕")
-    return f"🎁 Видано: {title} → {esc(u['name'])}. Лишилось подарунків: {len(u['gifts'])}."
+    return f"🎁 Видано: {title} → {esc(u['name'])}. Лишилось подарунків: {len(st.live(u))}."
 
 
 async def show_client_card(m: Message, k, u):
@@ -1211,7 +1300,7 @@ async def show_client_card(m: Message, k, u):
     have, _ = st.passport_state(u)
     text = (f"👤 <b>{esc(u['name'])}</b>\n{bar(u['stamps'])} {u['stamps']}/{goal_n()}\n"
             f"🧭 Паспорт: {len(have)}/{len(points())} точок")
-    if u["gifts"]:
+    if st.live(u):
         text += f"\n\n🎁 <b>Подарунки</b>\n{gift_lines(u)}"
     if u.get("prefs"):
         text += f"\n\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
@@ -1220,8 +1309,8 @@ async def show_client_card(m: Message, k, u):
         point = points()[0]
     tok = st.token(u)
     rows = [[InlineKeyboardButton(text=f"➕ Штамп ({point})", callback_data=f"cs:{tok}")]]
-    for goal in dict.fromkeys(g["goal"] for g in u["gifts"]):
-        rows.append([InlineKeyboardButton(text=f"🎁 Видати: {st.reward_title(goal, u)}"[:60], callback_data=f"cg:{tok}:{goal}")])
+    for g in st.live(u)[:8]:
+        rows.append([InlineKeyboardButton(text=f"🎁 Видати: {st.gift_title(g, u)}"[:60], callback_data=f"cg:{tok}:{g['id']}")])
     await m.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -1538,12 +1627,14 @@ SETTING_ITEMS = [
     ("alert_stamps_hour", "⚠️ Сповіщення: штампів/год"), ("alert_gifts_day", "⚠️ Сповіщення: подарунків/добу"),
     ("stamp_confirm", "🧾 Штамп за покупку (від ціни найдешевшої кави)"), ("stamp_cooldown", "⏱ Пауза між штампами (хв)"), ("stamp_daily_max", "🔒 Штампів на день"),
     ("ref_on", "👥 Запрошення друзів"), ("ref_max", "👥 Ліміт винагород за друзів"),
-    ("birthday_on", "🎂 Подарунок на ДН"), ("birthday_min_days", "🎂 Днів у боті до подарунка"), ("welcome_on", "🎁 Вітальний подарунок"),
+    ("gift_valid_days", "⏳ Термін подарунків, днів"), ("promo_valid_days", "⏳ Термін акц. купона, днів"),
+    ("backup_on", "💾 Щоденний бекап"), ("birthday_on", "🎂 Подарунок на ДН"), ("birthday_min_days", "🎂 Днів у боті до подарунка"), ("welcome_on", "🎁 Вітальний подарунок"),
 ]
-TOGGLES = {"weekly_on", "welcome_on", "promo_photo", "ref_on", "birthday_on", "stamp_confirm"}
+TOGGLES = {"weekly_on", "welcome_on", "promo_photo", "ref_on", "birthday_on", "stamp_confirm", "backup_on"}
 PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
 NUM_RANGES = {"stamps_goal": (2, 30), "passport_days": (1, 60), "stamp_cooldown": (0, 240),
-              "stamp_daily_max": (0, 20), "order_max_active": (1, 5), "noshow_limit": (0, 20), "alert_stamps_hour": (0, 100), "alert_gifts_day": (0, 100), "ref_max": (0, 50), "birthday_min_days": (0, 365)}
+              "stamp_daily_max": (0, 20), "order_max_active": (1, 5), "noshow_limit": (0, 20), "alert_stamps_hour": (0, 100), "alert_gifts_day": (0, 100), "ref_max": (0, 50), "birthday_min_days": (0, 365),
+              "gift_valid_days": (0, 365), "promo_valid_days": (1, 60)}
 
 
 class Setting(StatesGroup):
@@ -1571,7 +1662,7 @@ SETTING_GROUPS = [
     ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
     ("shop", "🏷 Заклад", ["shop", "points", "maps"]),
-    ("safe", "🛡 Захист і бонуси", ["order_max_active", "noshow_limit", "alert_stamps_hour", "alert_gifts_day", "stamp_confirm", "stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "birthday_on", "birthday_min_days"]),
+    ("safe", "🛡 Захист і бонуси", ["order_max_active", "noshow_limit", "alert_stamps_hour", "alert_gifts_day", "stamp_confirm", "stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "gift_valid_days", "promo_valid_days", "backup_on", "birthday_on", "birthday_min_days"]),
     ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on", "promo_photo"]),
 ]
 
@@ -1620,6 +1711,8 @@ SETTING_HELP = {
     "noshow_limit": "Після скількох «не забрали» за 30 днів передзамовлення клієнту вимикається. 0 — не обмежувати.",
     "alert_stamps_hour": "Бот напише власнику, якщо один бариста поставив стільки штампів за годину. 0 — вимкнено.",
     "alert_gifts_day": "Бот напише власнику, якщо один бариста видав стільки подарунків за добу. 0 — вимкнено.",
+    "gift_valid_days": "Скільки днів діє подарунок за штампи, паспорт, запрошення, ДН. Прострочені зникають самі, клієнта попереджають за 3 дні. 0 — безстроково.",
+    "promo_valid_days": "Скільки днів діє купон з акції чи «Скучили» (1–60). Купон одноразовий.",
     "stamp_daily_max": "Максимум штампів на день одному клієнту. 0 — без ліміту.",
     "ref_max": "Скільки подарунків за запрошених друзів може отримати один клієнт (0 — не нараховувати запрошувачу). Друг свій подарунок отримує завжди.",
     "birthday_min_days": "Скільки днів клієнт має бути в боті, щоб отримати подарунок на день народження (захист від «вказав дату сьогодні». 0 — без обмеження).",
@@ -1779,13 +1872,7 @@ def build_review():
 
 
 async def broadcast(bot: Bot, text: str):
-    sent = 0
-    png = promo_png(text)
-    for uid, _ in st.real():
-        if await send_promo(bot, uid, text, png):
-            sent += 1
-        await asyncio.sleep(0.05)
-    return sent
+    return await blast(bot, text)
 
 
 @router.message(F.text == O_WEEK, owner_only)
@@ -1830,12 +1917,48 @@ async def birthday_run(bot: Bot, n):
         if (time.time() - u.get("joined", time.time())) < st.cfg("birthday_min_days") * DAY:
             continue
         u["bday_year"] = n.year
-        st.grant(u, "birthday")
+        g = st.grant(u, "birthday")
         cnt += 1
-        await safe_send(bot, int(k), f"🎂 З днем народження! Подарунок від «{esc(shop())}»: "
-                                     f"<b>{esc(st.reward_title('birthday', u))}</b>. Покажіть QR бариста.")
+        st.save()
+        if not await send_coupon(bot, int(k), u, g, intro="🎂 З днем народження! Подарунок від нас.\n"):
+            await safe_send(bot, int(k), f"🎂 З днем народження! Подарунок: <b>{esc(st.gift_title(g, u))}</b>. Він у «{B_GIFTS}».")
     st.save()
     return cnt
+
+
+async def do_backup(bot, send=True, to=None):
+    """Копія бази у папку backups/ (7 останніх) і файлом власнику в Telegram."""
+    import shutil
+    folder = os.path.join(os.path.dirname(os.path.abspath(st.path)), "backups")
+    stamp = datetime.now(TZ).strftime("%Y-%m-%d_%H%M")
+    dst = os.path.join(folder, f"coffee_{stamp}.json")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        st.save()
+        shutil.copyfile(st.path, dst)
+        old = sorted(f for f in os.listdir(folder) if f.startswith("coffee_"))
+        for f in old[:-7]:
+            os.remove(os.path.join(folder, f))
+    except Exception:
+        log.exception("backup copy")
+    if send:
+        try:
+            data = open(st.path, "rb").read()
+        except Exception:
+            log.exception("backup read")
+            return False
+        for o in ([to] if to else owners()):
+            try:
+                await bot.send_document(o, BufferedInputFile(data, filename=f"coffee_{stamp}.json"),
+                                        caption=f"💾 Копія бази {stamp}. Клієнтів: {len(st.real())}.")
+            except TelegramAPIError as e:
+                log.warning("backup to %s failed: %s", o, e)
+    return True
+
+
+@router.message(Command("backup"), owner_only)
+async def backup_cmd(m: Message, bot: Bot):
+    await do_backup(bot, send=True, to=m.from_user.id)
 
 
 async def scheduler(bot: Bot):
@@ -1856,6 +1979,18 @@ async def scheduler(bot: Bot):
             if st.cfg("birthday_on") and n.hour >= 9 and st.d.get("bday_sent") != key:
                 st.d["bday_sent"] = key
                 await birthday_run(bot, n)
+            if n.hour >= 10 and st.d.get("gift_sweep") != key:
+                st.d["gift_sweep"] = key
+                gone, soon = st.sweep_gifts()
+                st.save()
+                for k, u, g in soon:
+                    await safe_send(bot, int(k), f"⏳ Ваш подарунок «{esc(st.gift_title(g, u))}» спливає {st.exp_text(g)[3:]}. "
+                                                 f"Заходьте — він у «{B_GIFTS}».")
+                log.info("gift sweep: expired=%s warned=%s", gone, len(soon))
+            if n.hour >= 3 and st.cfg("backup_on") and st.d.get("backup_sent") != key:
+                st.d["backup_sent"] = key
+                st.save()
+                await do_backup(bot, send=True)
             if st.cfg("weekly_on") and n.weekday() == 0 and n.hour == 9 and st.d.get("weekly_sent") != key:
                 st.d["weekly_sent"] = key
                 st.save()
