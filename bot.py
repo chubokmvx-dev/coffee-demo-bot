@@ -1,5 +1,5 @@
 """Демо-бот для кав'ярні: клієнтський режим + режим власника в одному боті."""
-import asyncio, html, logging, os, time
+import asyncio, html, io, logging, os, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -11,7 +11,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
 from store import PASSPORT_DAYS, POINTS, STAMPS_FOR_GIFT, WD, WD_ACC, Store
@@ -39,8 +39,8 @@ router = Router()
 
 # ---------- кнопки ----------
 B_STAMPS, B_GIFTS, B_ORDER = "☕ Мої штампи", "🎁 Подарунки", "⏱ Замовити наперед"
-B_POINTS, B_REVIEW, B_CODE = "📍 Наші точки", "⭐ Відгук", "📲 Мій код"
-B_USUAL, B_PREFS, B_PASS = "🔁 Як завжди", "✍️ Вподобання", "🧭 Паспорт"
+B_POINTS, B_REVIEW, B_CODE = "📍 Наші точки", "⭐ Відгук", "📲 Мій код"   # B_CODE лишився лише для старих клавіатур
+B_USUAL, B_PREFS, B_PASS = "🔁 Як завжди", "✍️ Вподобання", "🧭 Паспорт і QR"
 B_TO_OWNER, B_TO_CLIENT = "🔐 Режим власника", "🔄 Режим клієнта"
 O_PROMO, O_BACK, O_STAMP = "📣 Акція 11–14", "💤 Повернути зниклих", "➕ Штамп за кодом"
 O_REDEEM, O_REPORT = "🎁 Погасити подарунок", "📊 Звіт"
@@ -54,9 +54,9 @@ def rk(rows):
 
 
 def client_kb(uid):
-    rows = [[B_USUAL, B_ORDER], [B_STAMPS, B_PASS], [B_GIFTS, B_CODE], [B_POINTS, B_REVIEW], [B_PREFS]]
+    rows = [[B_USUAL, B_ORDER], [B_STAMPS, B_PASS], [B_GIFTS, B_POINTS], [B_REVIEW, B_PREFS]]
     if can_owner(uid):
-        rows[-1].append(B_TO_OWNER)
+        rows.append([B_TO_OWNER])
     return rk(rows)
 
 
@@ -92,6 +92,20 @@ async def safe_send(bot, chat_id, text, **kw):
         return False
 
 
+BOT_USERNAME = ""
+
+
+def qr_png(data: str) -> bytes:
+    import segno
+    buf = io.BytesIO()
+    segno.make(data, error="m").save(buf, kind="png", scale=10, border=3)
+    return buf.getvalue()
+
+
+def client_link(u):
+    return f"https://t.me/{BOT_USERNAME}?start=c_{st.token(u)}"
+
+
 def touch(uid):
     u = st.user(uid)
     if u:
@@ -122,9 +136,19 @@ class Prefs(StatesGroup):
 
 # ---------- старт ----------
 @router.message(CommandStart())
-async def start(m: Message, state: FSMContext):
+async def start(m: Message, state: FSMContext, command: CommandObject):
     await state.clear()
     uid = m.from_user.id
+    arg = (command.args or "").strip()
+    if arg.startswith("c_") and can_owner(uid):
+        k, target = st.by_token(arg[2:])
+        if target:
+            st.ensure(uid, m.from_user.full_name)[0]["mode"] = "owner"
+            await m.answer("🔐 Режим власника", reply_markup=owner_kb())
+            await show_client_card(m, k, target)
+            return
+        await m.answer("Цей QR не розпізнано.")
+        return
     u, new = st.ensure(uid, m.from_user.full_name)
     u["mode"] = "client"
     st.save()
@@ -203,7 +227,7 @@ async def my_stamps(m: Message, state: FSMContext):
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
     left = STAMPS_FOR_GIFT - u["stamps"]
     await m.answer(f"<b>Ваші штампи</b>\n{bar(u['stamps'])}  {u['stamps']}/{STAMPS_FOR_GIFT}\n\n"
-                   f"До подарунка лишилось: <b>{left}</b>. Назвіть бариста код з «{B_CODE}».")
+                   f"До подарунка лишилось: <b>{left}</b>. Покажіть бариста QR із «{B_PASS}».")
 
 
 @router.message(F.text == B_GIFTS)
@@ -211,16 +235,9 @@ async def my_gifts(m: Message, state: FSMContext):
     await state.clear()
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
     if u["gifts"]:
-        await m.answer(f"🎁 У вас подарунків: <b>{u['gifts']}</b>.\nПокажіть код з «{B_CODE}» бариста, щоб забрати.")
+        await m.answer(f"🎁 У вас подарунків: <b>{u['gifts']}</b>.\nПокажіть QR із «{B_PASS}» бариста, щоб забрати.")
     else:
         await m.answer("Подарунків поки немає. Збирайте штампи ☕")
-
-
-@router.message(F.text == B_CODE)
-async def my_code(m: Message, state: FSMContext):
-    await state.clear()
-    u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
-    await m.answer(f"Ваш код для бариста:\n\n<b><code>{u['code']}</code></b>\n\nНазвіть його на касі — додамо штамп.")
 
 
 @router.message(F.text == B_POINTS)
@@ -335,15 +352,23 @@ async def prefs_save(m: Message, state: FSMContext):
 
 
 # --- паспорт ---
-@router.message(F.text == B_PASS)
+@router.message(F.text.in_({B_PASS, B_CODE}))
 async def passport(m: Message, state: FSMContext):
     await state.clear()
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
     have, left = st.passport_state(u)
     rows = "\n".join(f"{'✅' if p in have else '⬜'} {esc(p)}" for p in POINTS)
     tail = (f"Лишилось днів: <b>{left}</b>." if have else f"Відвідайте всі точки за {PASSPORT_DAYS} днів.")
-    await m.answer(f"🧭 <b>Кавовий паспорт</b>\nВідвідайте кав'ярню й обидві будки за {PASSPORT_DAYS} днів — "
-                   f"і отримайте напій у подарунок.\n\n{rows}\n\n{tail}")
+    caption = (f"🧭 <b>Кавовий паспорт</b>\nКав'ярня й обидві будки за {PASSPORT_DAYS} днів — напій у подарунок.\n\n"
+               f"{rows}\n{tail}\n\n📲 Покажіть цей QR бариста на касі.\n"
+               f"Якщо не зчитується — назвіть код: <code>{u['code']}</code>")
+    try:
+        png = qr_png(client_link(u))
+    except Exception:
+        log.exception("qr")
+        await m.answer(caption)
+        return
+    await m.answer_photo(BufferedInputFile(png, filename="passport.png"), caption=caption)
 
 
 @router.callback_query(F.data.startswith("rd:"))
@@ -498,7 +523,7 @@ async def win_back_send(c: CallbackQuery, bot: Bot):
 @router.message(F.text == O_STAMP, owner_only)
 async def stamp_start(m: Message, state: FSMContext):
     await state.set_state(Stamp.code)
-    await m.answer("Введіть 4-значний код клієнта (він бачить його в «📲 Мій код»):")
+    await m.answer("Найшвидше — відскануйте QR клієнта камерою телефона. Або введіть код клієнта (клієнт бачить його під QR у «🧭 Паспорт і QR»):")
 
 
 @router.message(F.text == O_POINT, owner_only)
@@ -512,14 +537,8 @@ async def change_point(m: Message, state: FSMContext):
                    f"Натисніть ще раз, щоб змінити.")
 
 
-@router.message(Stamp.code, ~F.text.in_(ALL_BTNS))
-async def stamp_code(m: Message, state: FSMContext, bot: Bot):
-    k, u = st.by_code((m.text or "").strip())
-    if not u:
-        await m.answer("Такого коду немає. Спробуйте ще раз або натисніть іншу кнопку.")
-        return
-    await state.clear()
-    me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+async def apply_stamp(bot: Bot, me, k, u):
+    """Штамп на точці бариста. Повертає текст для бариста."""
     point = me.get("point", POINTS[0])
     u["stamps"] += 1
     u["last_visit"] = time.time()
@@ -530,25 +549,76 @@ async def stamp_code(m: Message, state: FSMContext, bot: Bot):
     passed = st.passport_mark(u, point)
     st.log_visit(point)
     st.save()
-    await m.answer(f"✅ Штамп додано: {esc(u['name'])} · {esc(point)}\n{bar(u['stamps'])} {u['stamps']}/{STAMPS_FOR_GIFT}"
-                   + ("\n🎉 Набрано подарунок!" if gift else "")
-                   + ("\n🧭 Паспорт пройдено — ще один подарунок!" if passed else ""))
     if not u.get("demo"):
         txt = f"☕ +1 штамп ({esc(point)})!\n{bar(u['stamps'])}  {u['stamps']}/{STAMPS_FOR_GIFT}"
         if gift:
-            txt = "🎉 Ви назбирали безкоштовний напій! Покажіть код бариста."
+            txt = "🎉 Ви назбирали безкоштовний напій! Покажіть QR бариста."
         if passed:
             txt += "\n🧭 Кавовий паспорт пройдено: усі точки за тиждень — вам ще один подарунок!"
         else:
             have, _left = st.passport_state(u)
             txt += f"\n🧭 Паспорт: {len(have)}/{len(POINTS)} точок"
         await safe_send(bot, int(k), txt)
+    return (f"✅ Штамп додано: {esc(u['name'])} · {esc(point)}\n{bar(u['stamps'])} {u['stamps']}/{STAMPS_FOR_GIFT}"
+            + ("\n🎉 Набрано подарунок!" if gift else "")
+            + ("\n🧭 Паспорт пройдено — ще один подарунок!" if passed else ""))
+
+
+async def apply_redeem(bot: Bot, k, u):
+    if not u["gifts"]:
+        return f"У {esc(u['name'])} немає подарунків."
+    u["gifts"] -= 1
+    st.save()
+    if not u.get("demo"):
+        await safe_send(bot, int(k), "🎁 Подарунок отримано. Смачної кави! ☕")
+    return f"🎁 Подарунок погашено: {esc(u['name'])}. Лишилось: {u['gifts']}."
+
+
+async def show_client_card(m: Message, k, u):
+    """Картка клієнта після скану QR: бариста сам обирає дію, тож повторний скан не дає подвійного штампа."""
+    have, _ = st.passport_state(u)
+    text = (f"👤 <b>{esc(u['name'])}</b>\n{bar(u['stamps'])} {u['stamps']}/{STAMPS_FOR_GIFT}\n"
+            f"🎁 Подарунків: {u['gifts']}\n🧭 Паспорт: {len(have)}/{len(POINTS)} точок")
+    if u.get("prefs"):
+        text += f"\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
+    point = st.user(m.from_user.id).get("point", POINTS[0])
+    rows = [[InlineKeyboardButton(text=f"➕ Штамп ({point})", callback_data=f"cs:{st.token(u)}")]]
+    if u["gifts"]:
+        rows.append([InlineKeyboardButton(text="🎁 Погасити подарунок", callback_data=f"cg:{st.token(u)}")])
+    await m.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith(("cs:", "cg:")))
+async def card_action(c: CallbackQuery, bot: Bot):
+    if not can_owner(c.from_user.id):
+        await c.answer("Недоступно", show_alert=True)
+        return
+    act, tok = c.data.split(":", 1)
+    k, u = st.by_token(tok)
+    if not u:
+        await c.answer("Клієнта не знайдено", show_alert=True)
+        return
+    me, _ = st.ensure(c.from_user.id, c.from_user.full_name)
+    res = await (apply_stamp(bot, me, k, u) if act == "cs" else apply_redeem(bot, k, u))
+    await c.message.edit_text(c.message.html_text + "\n\n" + res)
+    await c.answer()
+
+
+@router.message(Stamp.code, ~F.text.in_(ALL_BTNS))
+async def stamp_code(m: Message, state: FSMContext, bot: Bot):
+    k, u = st.by_code((m.text or "").strip())
+    if not u:
+        await m.answer("Такого коду немає. Спробуйте ще раз або натисніть іншу кнопку.")
+        return
+    await state.clear()
+    me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    await m.answer(await apply_stamp(bot, me, k, u))
 
 
 @router.message(F.text == O_REDEEM, owner_only)
 async def redeem_start(m: Message, state: FSMContext):
     await state.set_state(Redeem.code)
-    await m.answer("Введіть код клієнта, щоб погасити подарунок:")
+    await m.answer("Відскануйте QR клієнта (там є кнопка «Погасити») або введіть його код:")
 
 
 @router.message(Redeem.code, ~F.text.in_(ALL_BTNS))
@@ -558,14 +628,7 @@ async def redeem_code(m: Message, state: FSMContext, bot: Bot):
         await m.answer("Такого коду немає.")
         return
     await state.clear()
-    if not u["gifts"]:
-        await m.answer(f"У {esc(u['name'])} немає подарунків.")
-        return
-    u["gifts"] -= 1
-    st.save()
-    await m.answer(f"🎁 Подарунок погашено: {esc(u['name'])}. Лишилось: {u['gifts']}.")
-    if not u.get("demo"):
-        await safe_send(bot, int(k), "🎁 Подарунок отримано. Смачної кави! ☕")
+    await m.answer(await apply_redeem(bot, k, u))
 
 
 @router.message(F.text == O_REPORT, owner_only)
@@ -696,6 +759,12 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
     me = await bot.get_me()
+    global BOT_USERNAME
+    BOT_USERNAME = me.username
+    try:
+        log.info("qr self-test ok: %d bytes", len(qr_png(f"https://t.me/{BOT_USERNAME}?start=c_test")))
+    except Exception:
+        log.exception("qr self-test FAILED")
     log.info("started as @%s admins=%s", me.username, sorted(ADMIN_IDS))
     bg = asyncio.create_task(scheduler(bot))
     await dp.start_polling(bot)

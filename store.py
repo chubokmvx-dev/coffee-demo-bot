@@ -1,5 +1,5 @@
 """Мінімальне сховище в JSON-файлі + демо-база умовних клієнтів і журнал візитів."""
-import json, os, random, time
+import json, os, random, secrets, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -81,13 +81,26 @@ class Store:
         if u:
             return u, False
         used = {x["code"] for x in self.d["users"].values()}
-        code = next(c for c in (f"{random.randint(1000, 8999)}" for _ in range(10_000)) if c not in used)
+        code = next(c for c in (f"{random.randint(100000, 899999)}" for _ in range(10_000)) if c not in used)
         u = {"name": name, "phone": None, "demo": False, "stamps": 0, "gifts": 1, "mode": "client",
              "joined": time.time(), "last_visit": time.time(), "code": code, "owner_ok": False,
-             "point": POINTS[0], "pass": {}, "last": None, "prefs": ""}
+             "point": POINTS[0], "pass": {}, "last": None, "prefs": "", "token": secrets.token_urlsafe(8)}
         self.d["users"][str(uid)] = u
         self.save()
         return u, True
+
+    def token(self, u):
+        """Довгий непередбачуваний токен для QR; для старих записів створюється при першому використанні."""
+        if not u.get("token"):
+            u["token"] = secrets.token_urlsafe(8)
+            self.save()
+        return u["token"]
+
+    def by_token(self, tok):
+        for k, u in self.d["users"].items():
+            if u.get("token") == tok:
+                return k, u
+        return None, None
 
     def by_code(self, code):
         for k, u in self.d["users"].items():
