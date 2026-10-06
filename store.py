@@ -21,6 +21,7 @@ DEFAULT_SETTINGS = {
         "☔ Дощ за вікном — у нас тепло. Капучино −20% до 14:00.",
     ],
     "maps_url": os.getenv("MAPS_URL", "https://maps.google.com"),
+    "maps": {},          # відгуки по точках: {"Назва точки": "посилання"}; без запису діє maps_url
     "quiet_from": 11,
     "quiet_to": 14,
     "promo_time": "10:30",

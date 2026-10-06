@@ -36,6 +36,7 @@ def drinks(): return [tuple(d) for d in st.cfg("drinks")]
 def promos(): return st.cfg("promos")
 def shop(): return st.cfg("shop")
 def maps_url(): return st.cfg("maps_url")
+def maps_for(point): return st.cfg("maps").get(point) or maps_url()
 
 
 def drink(i):
@@ -739,23 +740,40 @@ async def review_start(m: Message, state: FSMContext):
     await show_rating(m)
 
 
-async def show_rating(m: Message):
+async def show_rating(m: Message, pt=None):
+    """Спершу точка (якщо їх кілька), потім оцінка. pt — індекс точки або None."""
+    ps = points()
+    if pt is None and len(ps) > 1:
+        rows = [[InlineKeyboardButton(text=f"📍 {p}", callback_data=f"rp:{k}")] for k, p in enumerate(ps)]
+        await m.answer("Де ви були?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+    k = pt if pt is not None else 0
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"{n}⭐", callback_data=f"rv:{n}") for n in range(1, 6)]])
-    await m.answer("Як вам візит? Оцініть від 1 до 5 ⭐", reply_markup=kb)
+        InlineKeyboardButton(text=f"{n}⭐", callback_data=f"rv:{n}:{k}") for n in range(1, 6)]])
+    await m.answer(f"Як вам візит ({esc(point_at(k))})? Оцініть від 1 до 5 ⭐" if len(ps) > 1
+                   else "Як вам візит? Оцініть від 1 до 5 ⭐", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("rp:"))
+async def review_point(c: CallbackQuery):
+    await c.message.delete()
+    await show_rating(c.message, int(c.data.split(":")[1]))
+    await c.answer()
 
 
 @router.callback_query(F.data.startswith("rv:"))
 async def review_rate(c: CallbackQuery, state: FSMContext):
-    s = int(c.data.split(":")[1])
+    parts = c.data.split(":")
+    s = int(parts[1])
+    pt = point_at(int(parts[2])) if len(parts) > 2 else points()[0]
     if s >= 4:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Залишити відгук на Google Maps", url=maps_url())]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Залишити відгук на Google Maps", url=maps_for(pt))]])
         await c.message.edit_text("Дякуємо за оцінку! 💛 Допоможете нам — залиште відгук на карті, це займе хвилину:", reply_markup=kb)
-        st.d["reviews"].append({"uid": c.from_user.id, "stars": s, "ts": time.time()})
+        st.d["reviews"].append({"uid": c.from_user.id, "stars": s, "point": pt, "ts": time.time()})
         st.save()
     else:
         await state.set_state(Review.comment)
-        await state.update_data(stars=s)
+        await state.update_data(stars=s, point=pt)
         await c.message.edit_text("Шкода, що так вийшло 😔 Напишіть, що не сподобалось — це побачить власник, і ми виправимось.")
     await c.answer()
 
@@ -764,10 +782,11 @@ async def review_rate(c: CallbackQuery, state: FSMContext):
 async def review_comment(m: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     await state.clear()
-    st.d["reviews"].append({"uid": m.from_user.id, "stars": data.get("stars"), "text": m.text, "ts": time.time()})
+    st.d["reviews"].append({"uid": m.from_user.id, "stars": data.get("stars"), "text": m.text, "point": data.get("point"), "ts": time.time()})
     st.save()
+    where = f" · {esc(data['point'])}" if data.get("point") else ""
     for o in owners():
-        await safe_send(bot, o, f"⚠️ <b>Низька оцінка {data.get('stars')}/5</b> (до Google не потрапила)\n"
+        await safe_send(bot, o, f"⚠️ <b>Низька оцінка {data.get('stars')}/5</b>{where} (до Google не потрапила)\n"
                                 f"{esc(m.from_user.full_name)}: {esc(m.text)}")
     await m.answer("Дякуємо, передали власнику. Ми обов'язково розберемось 🙏", reply_markup=client_kb(m.from_user.id))
 
@@ -1196,7 +1215,7 @@ SETTING_ITEMS = [
     ("passport_days", "🧭 Паспорт: днів"), ("points", "📍 Точки"), ("drinks", "🍵 Напої та ціни"),
     ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
-    ("maps_url", "⭐ Google Maps"), ("weekly_on", "🗓 Тижневий розбір"), ("welcome_on", "🎁 Вітальний подарунок"),
+    ("maps_url", "⭐ Google Maps (загальне)"), ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("welcome_on", "🎁 Вітальний подарунок"),
 ]
 TOGGLES = {"weekly_on", "welcome_on"}
 PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
@@ -1210,6 +1229,8 @@ def setting_value(key):
     if key == "quiet":
         return f"{st.cfg('quiet_from'):02d}:00–{st.cfg('quiet_to'):02d}:00"
     v = st.cfg(key)
+    if key == "maps":
+        return "\n".join(f"{p} - {v[p]}" for p in points() if v.get(p)) or "-"
     if key == "points":
         return ", ".join(v)
     if key in PRICE_KEYS:
@@ -1224,7 +1245,7 @@ def setting_value(key):
 SETTING_GROUPS = [
     ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
-    ("shop", "🏷 Заклад", ["shop", "points", "maps_url"]),
+    ("shop", "🏷 Заклад", ["shop", "points", "maps", "maps_url"]),
     ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on"]),
 ]
 
@@ -1236,6 +1257,8 @@ def group_of(key):
 def btn_value(key):
     if key in PRICE_KEYS or key == "points":
         return str(len(st.cfg(key)))
+    if key == "maps":
+        return f"{sum(1 for p in points() if st.cfg('maps').get(p))}/{len(points())}"
     if key == "maps_url":
         return "задано"
     return setting_value(key)
@@ -1271,7 +1294,9 @@ SETTING_HELP = {
     "promos": "Шаблони акцій — кожен з нового рядка (від 1 до 6, до 150 символів).",
     "quiet": "Тихі години, коли в закладі мало людей. Формат «11-14» (години від 0 до 23).",
     "promo_time": "О котрій надсилати заплановану акцію? Формат «10:30».",
-    "maps_url": "Посилання на сторінку закладу в Google Maps (починається з http).",
+    "maps_url": "Загальне посилання на Google Maps. Діє для точок, у яких немає свого посилання (починається з http).",
+    "maps": "Посилання на відгуки для кожної точки, кожне з нового рядка: «Точка - посилання». Приклад:\n"
+            "Кав'ярня - https://g.page/r/...\nБудка №1 - https://g.page/r/...\nТочку без посилання можна не вказувати.",
 }
 
 
@@ -1323,6 +1348,17 @@ def parse_setting(key, text):
         if key == "promo_time":
             h, mi = (int(x) for x in t.split(":"))
             return (True, f"{h:02d}:{mi:02d}") if 0 <= h <= 23 and 0 <= mi <= 59 else (False, "Приклад: 10:30.")
+        if key == "maps":
+            out = {}
+            for line in t.splitlines():
+                if not line.strip():
+                    continue
+                k = line.find("http")
+                name = line[:k].strip(" -–—:=\t") if k > 0 else ""
+                if k < 0 or name not in points():
+                    return False, f"Не розпізнав рядок: «{line.strip()[:40]}». Точка має бути зі списку: {', '.join(points())}."
+                out[name] = line[k:].strip()
+            return True, out
         if key == "maps_url":
             return (True, t) if t.startswith("http") else (False, "Посилання має починатися з http.")
     except (ValueError, IndexError):
