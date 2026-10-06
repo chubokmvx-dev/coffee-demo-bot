@@ -35,8 +35,7 @@ def points(): return st.cfg("points")
 def drinks(): return [tuple(d) for d in st.cfg("drinks")]
 def promos(): return st.cfg("promos")
 def shop(): return st.cfg("shop")
-def maps_url(): return st.cfg("maps_url")
-def maps_for(point): return st.cfg("maps").get(point) or maps_url()
+def maps_for(point): return st.cfg("maps").get(point)
 
 
 def drink(i):
@@ -767,8 +766,12 @@ async def review_rate(c: CallbackQuery, state: FSMContext):
     s = int(parts[1])
     pt = point_at(int(parts[2])) if len(parts) > 2 else points()[0]
     if s >= 4:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Залишити відгук на Google Maps", url=maps_for(pt))]])
-        await c.message.edit_text("Дякуємо за оцінку! 💛 Допоможете нам — залиште відгук на карті, це займе хвилину:", reply_markup=kb)
+        link = maps_for(pt)
+        if link:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Залишити відгук на Google Maps", url=link)]])
+            await c.message.edit_text("Дякуємо за оцінку! 💛 Допоможете нам — залиште відгук на карті, це займе хвилину:", reply_markup=kb)
+        else:
+            await c.message.edit_text("Дякуємо за оцінку! 💛 Чекаємо на вас знову.")
         st.d["reviews"].append({"uid": c.from_user.id, "stars": s, "point": pt, "ts": time.time()})
         st.save()
     else:
@@ -1215,7 +1218,7 @@ SETTING_ITEMS = [
     ("passport_days", "🧭 Паспорт: днів"), ("points", "📍 Точки"), ("drinks", "🍵 Напої та ціни"),
     ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
-    ("maps_url", "⭐ Google Maps (загальне)"), ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("welcome_on", "🎁 Вітальний подарунок"),
+    ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("welcome_on", "🎁 Вітальний подарунок"),
 ]
 TOGGLES = {"weekly_on", "welcome_on"}
 PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
@@ -1245,7 +1248,7 @@ def setting_value(key):
 SETTING_GROUPS = [
     ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
-    ("shop", "🏷 Заклад", ["shop", "points", "maps", "maps_url"]),
+    ("shop", "🏷 Заклад", ["shop", "points", "maps"]),
     ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on"]),
 ]
 
@@ -1259,8 +1262,6 @@ def btn_value(key):
         return str(len(st.cfg(key)))
     if key == "maps":
         return f"{sum(1 for p in points() if st.cfg('maps').get(p))}/{len(points())}"
-    if key == "maps_url":
-        return "задано"
     return setting_value(key)
 
 
@@ -1294,9 +1295,8 @@ SETTING_HELP = {
     "promos": "Шаблони акцій — кожен з нового рядка (від 1 до 6, до 150 символів).",
     "quiet": "Тихі години, коли в закладі мало людей. Формат «11-14» (години від 0 до 23).",
     "promo_time": "О котрій надсилати заплановану акцію? Формат «10:30».",
-    "maps_url": "Загальне посилання на Google Maps. Діє для точок, у яких немає свого посилання (починається з http).",
     "maps": "Посилання на відгуки для кожної точки, кожне з нового рядка: «Точка - посилання». Приклад:\n"
-            "Кав'ярня - https://g.page/r/...\nБудка №1 - https://g.page/r/...\nТочку без посилання можна не вказувати.",
+            "Кав'ярня - https://g.page/r/...\nБудка №1 - https://g.page/r/...\nДля точки без посилання клієнт просто отримає подяку.",
 }
 
 
@@ -1359,8 +1359,6 @@ def parse_setting(key, text):
                     return False, f"Не розпізнав рядок: «{line.strip()[:40]}». Точка має бути зі списку: {', '.join(points())}."
                 out[name] = line[k:].strip()
             return True, out
-        if key == "maps_url":
-            return (True, t) if t.startswith("http") else (False, "Посилання має починатися з http.")
     except (ValueError, IndexError):
         return False, "Не вдалося розібрати. Перевірте формат за прикладом."
     return False, "Невідоме налаштування."
