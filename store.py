@@ -4,21 +4,30 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 PATH = os.getenv("DATA_PATH", "/tmp/coffee_demo.json")
-STAMPS_FOR_GIFT = 8
-PASSPORT_DAYS = 7
-POINTS = ["Кав'ярня", "Будка №1", "Будка №2"]
 DAY = 86400
-DRINKS_NAMES = ["Еспресо", "Американо", "Капучино", "Лате"]
+DEFAULT_SETTINGS = {
+    "shop": os.getenv("SHOP_NAME", "Кав'ярня"),
+    "stamps_goal": 8,
+    "passport_days": 7,
+    "points": ["Кав'ярня", "Будка №1", "Будка №2"],
+    "drinks": [["Еспресо", 45], ["Американо", 55], ["Капучино", 70], ["Лате", 75]],
+    "promos": [
+        "☕ Друга кава за пів ціни до 14:00! Покажіть це повідомлення бариста.",
+        "🥐 Лате + круасан за 99 грн, тільки з 11:00 до 14:00.",
+        "☔ Дощ за вікном — у нас тепло. Капучино −20% до 14:00.",
+    ],
+    "maps_url": os.getenv("MAPS_URL", "https://maps.google.com"),
+    "quiet_from": 11,
+    "quiet_to": 14,
+    "promo_time": "10:30",
+    "weekly_on": True,
+    "welcome_on": True,
+}
 TZ = ZoneInfo("Europe/Kyiv")
 DEFAULT_REWARDS = {
     "welcome": "Безкоштовний напій до першої кави",
     "stamps": "Безкоштовна кава «як завжди» ({usual})",
     "passport": "Круасан",
-}
-GOAL_NAMES = {
-    "welcome": "вітальний подарунок",
-    "stamps": f"{STAMPS_FOR_GIFT} штампів",
-    "passport": f"паспорт: {len(POINTS)} точки за {PASSPORT_DAYS} днів",
 }
 WD = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
 WD_ACC = ["понеділок", "вівторок", "середу", "четвер", "п'ятницю", "суботу", "неділю"]
@@ -27,7 +36,7 @@ WD_ACC = ["понеділок", "вівторок", "середу", "четве�
 def _empty():
     return {"users": {}, "orders": {}, "next_order": 1, "seeded": False, "promos": 0, "reviews": [],
             "log": [], "scheduled": [], "weekly_sent": "", "seeded_log": False,
-            "rewards": dict(DEFAULT_REWARDS)}
+            "rewards": dict(DEFAULT_REWARDS), "settings": {}, "invites": {}}
 
 
 class Store:
@@ -40,6 +49,8 @@ class Store:
             self.d = _empty()
         for k, v in _empty().items():
             self.d.setdefault(k, v)
+        for k, v in DEFAULT_SETTINGS.items():
+            self.d["settings"].setdefault(k, v)
         for k, v in DEFAULT_REWARDS.items():
             self.d["rewards"].setdefault(k, v)
         for u in self.d["users"].values():     # міграція: раніше подарунки були числом
@@ -50,6 +61,14 @@ class Store:
         if not self.d["seeded_log"]:
             self._seed_log()
         self.save()
+
+    def cfg(self, key):
+        return self.d["settings"][key]
+
+    def goal_name(self, goal):
+        return {"welcome": "вітальний подарунок",
+                "stamps": f"{self.cfg('stamps_goal')} штампів",
+                "passport": f"паспорт: {len(self.cfg('points'))} точки за {self.cfg('passport_days')} днів"}[goal]
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -86,7 +105,7 @@ class Store:
                     k = round(n * (0.4 if day.weekday() == 1 else 1.0))
                 for _ in range(max(0, k + rnd.randint(-1, 1))):
                     ts = day.replace(hour=hour, minute=rnd.randint(0, 59)).timestamp()
-                    self.d["log"].append({"ts": ts, "point": rnd.choice(POINTS), "demo": True})
+                    self.d["log"].append({"ts": ts, "point": rnd.choice(self.cfg("points")), "demo": True})
         self.d["seeded_log"] = True
 
     # --- користувачі ---
@@ -99,9 +118,9 @@ class Store:
             return u, False
         used = {x["code"] for x in self.d["users"].values()}
         code = next(c for c in (f"{random.randint(100000, 899999)}" for _ in range(10_000)) if c not in used)
-        u = {"name": name, "phone": None, "demo": False, "stamps": 0, "gifts": [{"goal": "welcome"}], "mode": "client",
+        u = {"name": name, "phone": None, "demo": False, "stamps": 0, "gifts": [{"goal": "welcome"}] if self.cfg("welcome_on") else [], "mode": "client",
              "joined": time.time(), "last_visit": time.time(), "code": code, "owner_ok": False,
-             "point": POINTS[0], "pass": {}, "last": None, "prefs": "", "token": secrets.token_urlsafe(8)}
+             "point": self.cfg("points")[0], "pass": {}, "last": None, "prefs": "", "token": secrets.token_urlsafe(8)}
         self.d["users"][str(uid)] = u
         self.save()
         return u, True
@@ -150,8 +169,9 @@ class Store:
         text = self.d["rewards"].get(goal, DEFAULT_REWARDS.get(goal, "Подарунок"))
         usual = "напій на вибір"
         last = (u or {}).get("last")
-        if last:
-            usual = DRINKS_NAMES[last["drink"]] if last["drink"] < len(DRINKS_NAMES) else usual
+        names = [d[0] for d in self.cfg("drinks")]
+        if last and last["drink"] < len(names):
+            usual = names[last["drink"]]
         return text.replace("{usual}", usual)
 
     def grant(self, u, goal):
@@ -165,18 +185,19 @@ class Store:
 
     # --- паспорт ---
     def passport_state(self, u):
-        lim = time.time() - PASSPORT_DAYS * DAY
-        have = {p: ts for p, ts in (u.get("pass") or {}).items() if ts >= lim}
+        days = self.cfg("passport_days")
+        lim = time.time() - days * DAY
+        have = {p: ts for p, ts in (u.get("pass") or {}).items() if ts >= lim and p in self.cfg("points")}
         left = None
         if have:
-            left = max(0, int((min(have.values()) + PASSPORT_DAYS * DAY - time.time()) // DAY) + 1)
+            left = max(0, int((min(have.values()) + days * DAY - time.time()) // DAY) + 1)
         return have, left
 
     def passport_mark(self, u, point):
         """Відмітка візиту на точці. True, якщо паспорт щойно пройдено (усі точки за тиждень)."""
         have, _ = self.passport_state(u)
         have[point] = time.time()
-        if all(p in have for p in POINTS):
+        if all(p in have for p in self.cfg("points")):
             u["pass"] = {}
             u["gifts"].append({"goal": "passport"})
             return True
@@ -196,7 +217,7 @@ class Store:
             if e["ts"] < lim:
                 continue
             dt = datetime.fromtimestamp(e["ts"], TZ)
-            if 11 <= dt.hour < 14:
+            if self.cfg("quiet_from") <= dt.hour < self.cfg("quiet_to"):
                 sums[dt.weekday()] += 1
                 real += 0 if e.get("demo") else 1
         avg = [s / 4 for s in sums]            # у вікні 28 днів кожен день тижня зустрічається 4 рази

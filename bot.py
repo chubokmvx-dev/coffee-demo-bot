@@ -14,7 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
-from store import GOAL_NAMES, PASSPORT_DAYS, POINTS, STAMPS_FOR_GIFT, WD, WD_ACC, Store
+from store import WD, WD_ACC, Store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("coffee")
@@ -22,19 +22,30 @@ log = logging.getLogger("coffee")
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 DEMO_CODE = os.getenv("DEMO_CODE", "")          # якщо задано: /owner <код> дає режим власника
-SHOP = os.getenv("SHOP_NAME", "Кав'ярня")        # назва під клієнта
-MAPS_URL = os.getenv("MAPS_URL", "https://maps.google.com")
 TZ = ZoneInfo("Europe/Kyiv")
-
-DRINKS = [("Еспресо", 45), ("Американо", 55), ("Капучино", 70), ("Лате", 75)]
-PROMOS = [
-    "☕ Друга кава за пів ціни до 14:00! Покажіть це повідомлення бариста.",
-    "🥐 Лате + круасан за 99 грн, тільки з 11:00 до 14:00.",
-    "☔ Дощ за вікном — у нас тепло. Капучино −20% до 14:00.",
-]
 
 st = Store()
 router = Router()
+
+
+# ---------- налаштування (змінює власник) ----------
+def goal_n(): return st.cfg("stamps_goal")
+def pdays(): return st.cfg("passport_days")
+def points(): return st.cfg("points")
+def drinks(): return [tuple(d) for d in st.cfg("drinks")]
+def promos(): return st.cfg("promos")
+def shop(): return st.cfg("shop")
+def maps_url(): return st.cfg("maps_url")
+
+
+def drink(i):
+    ds = drinks()
+    return ds[i] if 0 <= i < len(ds) else ds[0]
+
+
+def point_at(k):
+    ps = points()
+    return ps[k] if 0 <= k < len(ps) else ps[0]
 
 
 # ---------- кнопки ----------
@@ -43,12 +54,15 @@ B_POINTS, B_REVIEW, B_CODE = "📍 Наші точки", "⭐ Відгук", "�
 B_USUAL, B_PREFS, B_PASS = "🔁 Як завжди", "✍️ Вподобання", "🧭 Паспорт і QR"   # B_USUAL/B_PREFS/B_ORDER/B_POINTS/B_REVIEW лишились для старих клавіатур
 B_MENU_ORDER, B_INFO = "☕ Замовити", "📍 Точки й відгук"
 B_TO_OWNER, B_TO_CLIENT = "🔐 Режим власника", "🔄 Режим клієнта"
-O_PROMO, O_BACK, O_STAMP = "📣 Акція 11–14", "💤 Повернути зниклих", "➕ Штамп за кодом"
+O_PROMO, O_BACK, O_STAMP = "📣 Акція", "💤 Повернути зниклих", "➕ Штамп за кодом"
+O_PROMO_OLD = "📣 Акція 11–14"          # для старих клавіатур
 O_REDEEM, O_REPORT = "🎁 Погасити подарунок", "📊 Звіт"
 O_WEEK, O_POINT, O_REWARDS = "🗓 Розбір тижня", "📍 Змінити точку", "🎁 Нагороди"
+O_SETTINGS, O_STAFF, B_ORDERS = "⚙️ Налаштування", "👥 Персонал", "🧾 Замовлення"
+B_TO_BARISTA = "👨‍🍳 Режим бариста"
 ALL_BTNS = {B_STAMPS, B_GIFTS, B_ORDER, B_POINTS, B_REVIEW, B_CODE, B_TO_OWNER, B_TO_CLIENT,
             B_USUAL, B_PREFS, B_PASS, O_PROMO, O_BACK, O_STAMP, O_REDEEM, O_REPORT, O_WEEK, O_POINT,
-            B_MENU_ORDER, B_INFO, O_REWARDS}
+            B_MENU_ORDER, B_INFO, O_REWARDS, O_PROMO_OLD, O_SETTINGS, O_STAFF, B_ORDERS, B_TO_BARISTA}
 
 
 def rk(rows):
@@ -59,16 +73,43 @@ def client_kb(uid):
     rows = [[B_MENU_ORDER, B_PASS], [B_STAMPS, B_GIFTS], [B_INFO]]
     if can_owner(uid):
         rows.append([B_TO_OWNER])
+    elif is_barista(uid):
+        rows.append([B_TO_BARISTA])
     return rk(rows)
 
 
 def owner_kb():
-    return rk([[O_PROMO, O_BACK], [O_STAMP, O_REDEEM], [O_WEEK, O_REPORT], [O_REWARDS, O_POINT], [B_TO_CLIENT]])
+    return rk([[O_PROMO, O_BACK], [O_STAMP, O_REDEEM], [B_ORDERS, O_POINT], [O_WEEK, O_REPORT],
+               [O_REWARDS, O_SETTINGS], [O_STAFF, B_TO_CLIENT]])
+
+
+def barista_kb():
+    return rk([[O_STAMP, O_REDEEM], [B_ORDERS, O_POINT], [B_TO_CLIENT]])
+
+
+def staff_kb(uid):
+    return owner_kb() if can_owner(uid) else barista_kb()
 
 
 def can_owner(uid):
     u = st.user(uid)
     return uid in ADMIN_IDS or bool(u and u.get("owner_ok"))
+
+
+def is_barista(uid):
+    u = st.user(uid)
+    return bool(u and u.get("barista"))
+
+
+def can_staff(uid):
+    return can_owner(uid) or is_barista(uid)
+
+
+def order_recipients(point):
+    """Власники + бариста тієї точки (якщо на точці нікого немає — усі бариста)."""
+    baristas = [i for i, u in st.real() if u.get("barista")]
+    here = [i for i in baristas if (st.user(i) or {}).get("point") == point]
+    return set(owners()) | set(here or baristas)
 
 
 def owners():
@@ -82,7 +123,7 @@ def esc(s):
 
 
 def bar(n):
-    return "●" * n + "○" * (STAMPS_FOR_GIFT - n)
+    return "●" * n + "○" * (goal_n() - n)
 
 
 async def safe_send(bot, chat_id, text, **kw):
@@ -95,6 +136,11 @@ async def safe_send(bot, chat_id, text, **kw):
 
 
 BOT_USERNAME = ""
+_BOT = None
+
+
+def bot_ref():
+    return _BOT
 
 
 def qr_png(data: str) -> bytes:
@@ -146,14 +192,28 @@ async def start(m: Message, state: FSMContext, command: CommandObject):
     await state.clear()
     uid = m.from_user.id
     arg = (command.args or "").strip()
-    if arg.startswith("c_") and can_owner(uid):
+    if arg.startswith("c_") and can_staff(uid):
         k, target = st.by_token(arg[2:])
         if target:
-            st.ensure(uid, m.from_user.full_name)[0]["mode"] = "owner"
-            await m.answer("🔐 Режим власника", reply_markup=owner_kb())
+            st.ensure(uid, m.from_user.full_name)[0]["mode"] = "owner" if can_owner(uid) else "barista"
+            await m.answer("🧾 Картка клієнта", reply_markup=staff_kb(uid))
             await show_client_card(m, k, target)
             return
         await m.answer("Цей QR не розпізнано.")
+        return
+    if arg.startswith("b_"):
+        ts = st.d["invites"].pop(arg[2:], None)
+        if ts and time.time() - ts < 48 * 3600:
+            u, _ = st.ensure(uid, m.from_user.full_name)
+            u["barista"], u["mode"] = True, "barista"
+            st.save()
+            for o in owners():
+                await safe_send(bot_ref(), o, f"👨‍🍳 {esc(m.from_user.full_name)} тепер бариста.")
+            await m.answer("👨‍🍳 Вас додано як бариста. Скануйте QR клієнтів, ставте штампи й видавайте подарунки. "
+                           "Натисніть «📍 Змінити точку», щоб обрати, де ви працюєте.", reply_markup=barista_kb())
+            return
+        st.save()
+        await m.answer("Це запрошення вже використане або прострочене. Попросіть власника створити нове.")
         return
     u, new = st.ensure(uid, m.from_user.full_name)
     u["mode"] = "client"
@@ -161,8 +221,8 @@ async def start(m: Message, state: FSMContext, command: CommandObject):
     if new:
         await m.answer(
             f"Привіт, {esc(m.from_user.first_name)}! ☕\n"
-            f"Це бот «{esc(SHOP)}». Ми вже додали вам <b>подарунок</b>: {esc(st.reward_title('welcome'))}.\n\n"
-            f"Збирайте штампи: кожен {STAMPS_FOR_GIFT}-й напій у подарунок. "
+            f"Це бот «{esc(shop())}». Ми вже додали вам <b>подарунок</b>: {esc(st.reward_title('welcome'))}.\n\n"
+            f"Збирайте штампи: кожен {goal_n()}-й напій у подарунок. "
             f"Штампи працюють у кав'ярні та на всіх будках.",
             reply_markup=client_kb(uid))
         await m.answer(
@@ -216,6 +276,17 @@ async def to_owner(m: Message, state: FSMContext):
     await m.answer("🔐 Режим власника.", reply_markup=owner_kb())
 
 
+@router.message(F.text == B_TO_BARISTA)
+async def to_barista(m: Message, state: FSMContext):
+    await state.clear()
+    if not can_staff(m.from_user.id):
+        return
+    u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    u["mode"] = "barista"
+    st.save()
+    await m.answer("👨‍🍳 Режим бариста.", reply_markup=barista_kb())
+
+
 @router.message(F.text == B_TO_CLIENT)
 async def to_client(m: Message, state: FSMContext):
     await state.clear()
@@ -231,13 +302,13 @@ async def to_client(m: Message, state: FSMContext):
 async def my_stamps(m: Message, state: FSMContext):
     await state.clear()
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
-    left = STAMPS_FOR_GIFT - u["stamps"]
-    await m.answer(f"<b>Ваші штампи</b>\n{bar(u['stamps'])}  {u['stamps']}/{STAMPS_FOR_GIFT}\n\n"
+    left = goal_n() - u["stamps"]
+    await m.answer(f"<b>Ваші штампи</b>\n{bar(u['stamps'])}  {u['stamps']}/{goal_n()}\n\n"
                    f"До подарунка лишилось: <b>{left}</b>. Покажіть бариста QR із «{B_PASS}».")
 
 
 def gift_lines(u):
-    return "\n".join(f"• <b>{esc(st.reward_title(g['goal'], u))}</b> — {GOAL_NAMES[g['goal']]}" for g in u["gifts"])
+    return "\n".join(f"• <b>{esc(st.reward_title(g['goal'], u))}</b> — {st.goal_name(g['goal'])}" for g in u["gifts"])
 
 
 @router.message(F.text == B_GIFTS)
@@ -246,8 +317,8 @@ async def my_gifts(m: Message, state: FSMContext):
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
     have, _left = st.passport_state(u)
     goals = (f"🎯 <b>Як отримати подарунок</b>\n"
-             f"☕ {STAMPS_FOR_GIFT} штампів ({u['stamps']}/{STAMPS_FOR_GIFT}) → {esc(st.reward_title('stamps', u))}\n"
-             f"🧭 Паспорт ({len(have)}/{len(POINTS)} точок за {PASSPORT_DAYS} днів) → {esc(st.reward_title('passport', u))}")
+             f"☕ {goal_n()} штампів ({u['stamps']}/{goal_n()}) → {esc(st.reward_title('stamps', u))}\n"
+             f"🧭 Паспорт ({len(have)}/{len(points())} точок за {pdays()} днів) → {esc(st.reward_title('passport', u))}")
     if u["gifts"]:
         await m.answer(f"🎁 <b>Ваші подарунки</b>\n{gift_lines(u)}\n\nПокажіть QR із «{B_PASS}» бариста, щоб забрати.\n\n{goals}")
     else:
@@ -255,12 +326,12 @@ async def my_gifts(m: Message, state: FSMContext):
 
 
 def points_text():
-    return ("📍 <b>Наші точки</b>\n" + "\n".join(f"• {p}" for p in POINTS) +
+    return ("📍 <b>Наші точки</b>\n" + "\n".join(f"• {p}" for p in points()) +
             "\n\nШтампи й подарунки діють на всіх точках.")
 
 
 @router.message(F.text == B_POINTS)
-async def points(m: Message, state: FSMContext):
+async def points_handler(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(points_text())
 
@@ -272,7 +343,7 @@ async def order_menu(m: Message, state: FSMContext):
     rows = []
     last = u.get("last")
     if last:
-        rows.append([InlineKeyboardButton(text=f"🔁 Як завжди: {DRINKS[last['drink']][0]}", callback_data="mn:usual")])
+        rows.append([InlineKeyboardButton(text=f"🔁 Як завжди: {drink(last['drink'])[0]}", callback_data="mn:usual")])
     rows.append([InlineKeyboardButton(text="🆕 Нове замовлення", callback_data="mn:new")])
     rows.append([InlineKeyboardButton(text="✍️ Вподобання" + (" ✓" if u.get("prefs") else ""), callback_data="mn:prefs")])
     await m.answer("☕ Що робимо?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -306,7 +377,7 @@ async def menu_cb(c: CallbackQuery, state: FSMContext):
 # --- предзамовлення ---
 async def show_drinks(msg: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"od:{i}")] for i, (n, p) in enumerate(DRINKS)])
+        [InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"od:{i}")] for i, (n, p) in enumerate(drinks())])
     await msg.answer("Що замовити?", reply_markup=kb)
 
 
@@ -321,7 +392,7 @@ async def order_time(c: CallbackQuery):
     i = int(c.data.split(":")[1])
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"через {t} хв", callback_data=f"ot:{i}:{t}") for t in (5, 10, 15)]])
-    await c.message.edit_text(f"<b>{DRINKS[i][0]}</b>. Коли забрати?", reply_markup=kb)
+    await c.message.edit_text(f"<b>{drink(i)[0]}</b>. Коли забрати?", reply_markup=kb)
     await c.answer()
 
 
@@ -329,15 +400,15 @@ async def order_time(c: CallbackQuery):
 async def order_point(c: CallbackQuery):
     _, i, t = c.data.split(":")
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=p, callback_data=f"op:{i}:{t}:{k}")] for k, p in enumerate(POINTS)])
+        [InlineKeyboardButton(text=p, callback_data=f"op:{i}:{t}:{k}")] for k, p in enumerate(points())])
     await c.message.edit_text("Де забрати?", reply_markup=kb)
     await c.answer()
 
 
 async def place_order(bot: Bot, user, i: int, t: int, k: int, usual=False):
     """Створює замовлення, зберігає його як «останнє» і сповіщає власника. Повертає текст для клієнта."""
-    name, price = DRINKS[i]
-    point = POINTS[k]
+    name, price = drink(i)
+    point = point_at(k)
     u, _ = st.ensure(user.id, user.full_name)
     n = st.add_order(user.id, name, price, t, point)
     u["last"] = {"drink": i, "point": k}
@@ -347,7 +418,7 @@ async def place_order(bot: Bot, user, i: int, t: int, k: int, usual=False):
     note = ("\n🔁 Постійний клієнт: «як завжди»" if usual else "")
     if u.get("prefs"):
         note += f"\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
-    for o in owners():
+    for o in order_recipients(point):
         await safe_send(bot, o, f"🆕 <b>Замовлення №{n}</b>\n{name} · {price} грн\n📍 {esc(point)} · через {t} хв\n"
                                 f"Клієнт: {esc(user.full_name)}{note}", reply_markup=kb)
     return (f"✅ Замовлення №{n} прийнято\n<b>{name}</b> · {price} грн\n"
@@ -376,10 +447,10 @@ async def show_usual(m: Message, user):
         await m.answer(f"Ви ще нічого не замовляли. Зробіть перше замовлення через «{B_ORDER}» — "
                        f"далі «Як завжди» повторить його одним дотиком.")
         return
-    name, price = DRINKS[last["drink"]]
+    name, price = drink(last["drink"])
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"через {t} хв", callback_data=f"uz:{t}") for t in (5, 10, 15)]])
-    await m.answer(f"🔁 Як завжди: <b>{name}</b> · {price} грн\n📍 {esc(POINTS[last['point']])}\nКоли забрати?",
+    await m.answer(f"🔁 Як завжди: <b>{name}</b> · {price} грн\n📍 {esc(point_at(last['point']))}\nКоли забрати?",
                    reply_markup=kb)
 
 
@@ -425,9 +496,9 @@ async def passport(m: Message, state: FSMContext):
     await state.clear()
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
     have, left = st.passport_state(u)
-    rows = "\n".join(f"{'✅' if p in have else '⬜'} {esc(p)}" for p in POINTS)
-    tail = (f"Лишилось днів: <b>{left}</b>." if have else f"Відвідайте всі точки за {PASSPORT_DAYS} днів.")
-    caption = (f"🧭 <b>Кавовий паспорт</b>\nКав'ярня й обидві будки за {PASSPORT_DAYS} днів — подарунок: "
+    rows = "\n".join(f"{'✅' if p in have else '⬜'} {esc(p)}" for p in points())
+    tail = (f"Лишилось днів: <b>{left}</b>." if have else f"Відвідайте всі точки за {pdays()} днів.")
+    caption = (f"🧭 <b>Кавовий паспорт</b>\nКав'ярня й обидві будки за {pdays()} днів — подарунок: "
                f"<b>{esc(st.reward_title('passport', u))}</b>.\n\n"
                f"{rows}\n{tail}\n\n📲 Покажіть цей QR бариста на касі.\n"
                f"Якщо не зчитується — назвіть код: <code>{u['code']}</code>")
@@ -442,7 +513,7 @@ async def passport(m: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("rd:"))
 async def order_ready(c: CallbackQuery, bot: Bot):
-    if not can_owner(c.from_user.id):
+    if not can_staff(c.from_user.id):
         await c.answer("Недоступно", show_alert=True)
         return
     n = c.data.split(":")[1]
@@ -474,7 +545,7 @@ async def show_rating(m: Message):
 async def review_rate(c: CallbackQuery, state: FSMContext):
     s = int(c.data.split(":")[1])
     if s >= 4:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Залишити відгук на Google Maps", url=MAPS_URL)]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Залишити відгук на Google Maps", url=maps_url())]])
         await c.message.edit_text("Дякуємо за оцінку! 💛 Допоможете нам — залиште відгук на карті, це займе хвилину:", reply_markup=kb)
         st.d["reviews"].append({"uid": c.from_user.id, "stars": s, "ts": time.time()})
         st.save()
@@ -502,12 +573,16 @@ def owner_only(m: Message):
     return can_owner(m.from_user.id)
 
 
-@router.message(F.text == O_PROMO, owner_only)
+def staff_only(m: Message):
+    return can_staff(m.from_user.id)
+
+
+@router.message(F.text.in_({O_PROMO, O_PROMO_OLD}), owner_only)
 async def promo_start(m: Message, state: FSMContext):
     await state.clear()
-    rows = [[InlineKeyboardButton(text=p[:50] + ("…" if len(p) > 50 else ""), callback_data=f"pm:{i}")] for i, p in enumerate(PROMOS)]
+    rows = [[InlineKeyboardButton(text=p[:50] + ("…" if len(p) > 50 else ""), callback_data=f"pm:{i}")] for i, p in enumerate(promos())]
     rows.append([InlineKeyboardButton(text="✍️ Свій текст", callback_data="pm:c")])
-    await m.answer("📣 <b>Акція на тихі години (11:00–14:00)</b>\nОберіть шаблон або напишіть свій:",
+    await m.answer(f"📣 <b>Акція на тихі години ({quiet_text()})</b>\nОберіть шаблон або напишіть свій:",
                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -521,7 +596,7 @@ async def promo_pick(c: CallbackQuery, state: FSMContext):
         await state.set_state(Promo.custom)
         await c.message.edit_text("Напишіть текст акції одним повідомленням:")
     else:
-        await promo_preview(c.message, state, PROMOS[int(key)])
+        await promo_preview(c.message, state, promos()[int(key)])
     await c.answer()
 
 
@@ -593,18 +668,18 @@ async def win_back_send(c: CallbackQuery, bot: Bot):
     await c.answer()
 
 
-@router.message(F.text == O_STAMP, owner_only)
+@router.message(F.text == O_STAMP, staff_only)
 async def stamp_start(m: Message, state: FSMContext):
     await state.set_state(Stamp.code)
     await m.answer("Найшвидше — відскануйте QR клієнта камерою телефона. Або введіть код клієнта (клієнт бачить його під QR у «🧭 Паспорт і QR»):")
 
 
-@router.message(F.text == O_POINT, owner_only)
+@router.message(F.text == O_POINT, staff_only)
 async def change_point(m: Message, state: FSMContext):
     await state.clear()
     u, _ = st.ensure(m.from_user.id, m.from_user.full_name)
-    cur = u.get("point", POINTS[0])
-    u["point"] = POINTS[(POINTS.index(cur) + 1) % len(POINTS)] if cur in POINTS else POINTS[0]
+    cur = u.get("point", points()[0])
+    u["point"] = points()[(points().index(cur) + 1) % len(points())] if cur in points() else points()[0]
     st.save()
     await m.answer(f"📍 Ви працюєте на точці: <b>{esc(u['point'])}</b>. Штампи записуватимуться сюди. "
                    f"Натисніть ще раз, щоб змінити.")
@@ -612,10 +687,12 @@ async def change_point(m: Message, state: FSMContext):
 
 async def apply_stamp(bot: Bot, me, k, u):
     """Штамп на точці бариста. Повертає текст для бариста."""
-    point = me.get("point", POINTS[0])
+    point = me.get("point")
+    if point not in points():
+        point = points()[0]
     u["stamps"] += 1
     u["last_visit"] = time.time()
-    gift = u["stamps"] >= STAMPS_FOR_GIFT
+    gift = u["stamps"] >= goal_n()
     if gift:
         u["stamps"] = 0
         st.grant(u, "stamps")
@@ -625,16 +702,16 @@ async def apply_stamp(bot: Bot, me, k, u):
     g_stamps = esc(st.reward_title("stamps", u))
     g_pass = esc(st.reward_title("passport", u))
     if not u.get("demo"):
-        txt = f"☕ +1 штамп ({esc(point)})!\n{bar(u['stamps'])}  {u['stamps']}/{STAMPS_FOR_GIFT}"
+        txt = f"☕ +1 штамп ({esc(point)})!\n{bar(u['stamps'])}  {u['stamps']}/{goal_n()}"
         if gift:
-            txt = f"🎉 {STAMPS_FOR_GIFT} штампів! Ваш подарунок: <b>{g_stamps}</b>. Покажіть QR бариста."
+            txt = f"🎉 {goal_n()} штампів! Ваш подарунок: <b>{g_stamps}</b>. Покажіть QR бариста."
         if passed:
             txt += f"\n🧭 Паспорт пройдено — подарунок: <b>{g_pass}</b>!"
         else:
             have, _left = st.passport_state(u)
-            txt += f"\n🧭 Паспорт: {len(have)}/{len(POINTS)} точок"
+            txt += f"\n🧭 Паспорт: {len(have)}/{len(points())} точок"
         await safe_send(bot, int(k), txt)
-    return (f"✅ Штамп додано: {esc(u['name'])} · {esc(point)}\n{bar(u['stamps'])} {u['stamps']}/{STAMPS_FOR_GIFT}"
+    return (f"✅ Штамп додано: {esc(u['name'])} · {esc(point)}\n{bar(u['stamps'])} {u['stamps']}/{goal_n()}"
             + (f"\n🎉 Подарунок за штампи: {g_stamps}" if gift else "")
             + (f"\n🧭 Паспорт пройдено — подарунок: {g_pass}" if passed else ""))
 
@@ -653,13 +730,15 @@ async def apply_redeem(bot: Bot, k, u, goal=None):
 async def show_client_card(m: Message, k, u):
     """Картка клієнта після скану QR: бариста сам обирає дію, тож повторний скан не дає подвійного штампа."""
     have, _ = st.passport_state(u)
-    text = (f"👤 <b>{esc(u['name'])}</b>\n{bar(u['stamps'])} {u['stamps']}/{STAMPS_FOR_GIFT}\n"
-            f"🧭 Паспорт: {len(have)}/{len(POINTS)} точок")
+    text = (f"👤 <b>{esc(u['name'])}</b>\n{bar(u['stamps'])} {u['stamps']}/{goal_n()}\n"
+            f"🧭 Паспорт: {len(have)}/{len(points())} точок")
     if u["gifts"]:
         text += f"\n\n🎁 <b>Подарунки</b>\n{gift_lines(u)}"
     if u.get("prefs"):
         text += f"\n\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
-    point = st.user(m.from_user.id).get("point", POINTS[0])
+    point = st.user(m.from_user.id).get("point")
+    if point not in points():
+        point = points()[0]
     tok = st.token(u)
     rows = [[InlineKeyboardButton(text=f"➕ Штамп ({point})", callback_data=f"cs:{tok}")]]
     for goal in dict.fromkeys(g["goal"] for g in u["gifts"]):
@@ -669,7 +748,7 @@ async def show_client_card(m: Message, k, u):
 
 @router.callback_query(F.data.startswith(("cs:", "cg:")))
 async def card_action(c: CallbackQuery, bot: Bot):
-    if not can_owner(c.from_user.id):
+    if not can_staff(c.from_user.id):
         await c.answer("Недоступно", show_alert=True)
         return
     act, tok, *rest = c.data.split(":")
@@ -694,7 +773,7 @@ async def stamp_code(m: Message, state: FSMContext, bot: Bot):
     await m.answer(await apply_stamp(bot, me, k, u))
 
 
-@router.message(F.text == O_REDEEM, owner_only)
+@router.message(F.text == O_REDEEM, staff_only)
 async def redeem_start(m: Message, state: FSMContext):
     await state.set_state(Redeem.code)
     await m.answer("Відскануйте QR клієнта (там є кнопка «Погасити») або введіть його код:")
@@ -713,7 +792,7 @@ async def redeem_code(m: Message, state: FSMContext, bot: Bot):
 @router.message(F.text == O_REWARDS, owner_only)
 async def rewards_menu(m: Message, state: FSMContext):
     await state.clear()
-    rows = [[InlineKeyboardButton(text=f"{GOAL_NAMES[g]}: {st.d['rewards'][g]}"[:60], callback_data=f"rw:{g}")]
+    rows = [[InlineKeyboardButton(text=f"{st.goal_name(g)}: {st.d['rewards'][g]}"[:60], callback_data=f"rw:{g}")]
             for g in ("passport", "stamps", "welcome")]
     await m.answer("🎁 <b>Нагороди за цілі</b>\nОберіть, що змінити. На кнопці — поточна нагорода.",
                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -728,7 +807,7 @@ async def rewards_pick(c: CallbackQuery, state: FSMContext):
     await state.set_state(Reward.text)
     await state.update_data(goal=goal)
     hint = "\nМожна використати {usual} — підставиться улюблений напій клієнта." if goal == "stamps" else ""
-    await c.message.answer(f"Ціль: <b>{GOAL_NAMES[goal]}</b>\nЗараз: <b>{esc(st.d['rewards'][goal])}</b>\n"
+    await c.message.answer(f"Ціль: <b>{st.goal_name(goal)}</b>\nЗараз: <b>{esc(st.d['rewards'][goal])}</b>\n"
                            f"Напишіть нову нагороду одним повідомленням.{hint}")
     await c.answer()
 
@@ -743,7 +822,7 @@ async def rewards_save(m: Message, state: FSMContext):
         return
     st.d["rewards"][goal] = text
     st.save()
-    await m.answer(f"✅ Нагорода за «{GOAL_NAMES[goal]}»: <b>{esc(text)}</b>\nКлієнти побачать її одразу.")
+    await m.answer(f"✅ Нагорода за «{st.goal_name(goal)}»: <b>{esc(text)}</b>\nКлієнти побачать її одразу.")
 
 
 @router.message(F.text == O_REPORT, owner_only)
@@ -763,12 +842,212 @@ async def report(m: Message, state: FSMContext):
         f"Замовлень через бота: {orders}\n"
         f"Розсилок зроблено: {st.d.get('promos', 0)}\n\n"
         "<b>Приклад звіту по акції (демо-цифри, не реальні)</b>\n"
-        "Чеків 11:00–14:00 за день: було 14 → стало 23\n"
+        f"Чеків {quiet_text()} за день: було 14 → стало 23\n"
         "У реальному запуску ці цифри беремо з вашого Poster.")
 
 
+# ---------- відкриті замовлення (бариста й власник) ----------
+@router.message(F.text == B_ORDERS, staff_only)
+async def open_orders(m: Message, state: FSMContext):
+    await state.clear()
+    me, _ = st.ensure(m.from_user.id, m.from_user.full_name)
+    cutoff = time.time() - 6 * 3600
+    mine = me.get("point")
+    items = [(n, o) for n, o in st.d["orders"].items()
+             if not o["done"] and o["ts"] > cutoff and (can_owner(m.from_user.id) or o["point"] == mine or mine not in points())]
+    if not items:
+        await m.answer("🧾 Відкритих замовлень немає.")
+        return
+    for n, o in items[-10:]:
+        cu = st.user(o["uid"]) or {}
+        note = f"\n📝 {esc(cu['prefs'])}" if cu.get("prefs") else ""
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Готово", callback_data=f"rd:{n}")]])
+        await m.answer(f"🧾 <b>№{n}</b> · {o['drink']} · {o['price']} грн\n📍 {esc(o['point'])} · через {o['min']} хв · "
+                       f"{esc(cu.get('name', ''))}{note}", reply_markup=kb)
+
+
+# ---------- персонал ----------
+@router.message(F.text == O_STAFF, owner_only)
+async def staff_menu(m: Message, state: FSMContext):
+    await state.clear()
+    rows = [[InlineKeyboardButton(text="➕ Запросити бариста", callback_data="sf:inv")]]
+    lines = []
+    for i, u in st.real():
+        if u.get("barista"):
+            lines.append(f"• {esc(u['name'])} · {esc(u.get('point', ''))}")
+            rows.append([InlineKeyboardButton(text=f"❌ Прибрати: {u['name']}"[:60], callback_data=f"sf:rm:{i}")])
+    txt = "👥 <b>Персонал</b>\n" + ("\n".join(lines) if lines else "Бариста поки немає.") + \
+          "\n\nБариста може: скануйте QR, ставити штампи, видавати подарунки, бачити й закривати замовлення. " \
+          "Акції, звіти, нагороди й налаштування — тільки власнику."
+    await m.answer(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("sf:"))
+async def staff_cb(c: CallbackQuery):
+    if not can_owner(c.from_user.id):
+        await c.answer("Недоступно", show_alert=True)
+        return
+    _, act, *rest = c.data.split(":")
+    if act == "inv":
+        import secrets
+        tok = secrets.token_urlsafe(6)
+        st.d["invites"][tok] = time.time()
+        st.save()
+        await c.message.answer(f"👨‍🍳 Запрошення для бариста (одноразове, діє 48 годин):\n"
+                               f"https://t.me/{BOT_USERNAME}?start=b_{tok}\n\n"
+                               f"Надішліть це посилання бариста — він відкриє його в Telegram.")
+    elif act == "rm":
+        u = st.user(int(rest[0]))
+        if u:
+            u["barista"] = False
+            if u.get("mode") == "barista":
+                u["mode"] = "client"
+            st.save()
+            await safe_send(bot_ref(), int(rest[0]), "Ваш доступ бариста вимкнено.", reply_markup=client_kb(int(rest[0])))
+            await c.message.edit_text(c.message.html_text + f"\n\n✅ Прибрано: {esc(u['name'])}")
+    await c.answer()
+
+
+# ---------- налаштування ----------
+SETTING_ITEMS = [
+    ("shop", "🏷 Назва закладу"), ("stamps_goal", "☕ Штампів до подарунка"),
+    ("passport_days", "🧭 Паспорт: днів"), ("points", "📍 Точки"), ("drinks", "🍵 Напої та ціни"),
+    ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
+    ("maps_url", "⭐ Google Maps"), ("weekly_on", "🗓 Тижневий розбір"), ("welcome_on", "🎁 Вітальний подарунок"),
+]
+TOGGLES = {"weekly_on", "welcome_on"}
+
+
+class Setting(StatesGroup):
+    entry = State()
+
+
+def setting_value(key):
+    if key == "quiet":
+        return f"{st.cfg('quiet_from'):02d}:00–{st.cfg('quiet_to'):02d}:00"
+    v = st.cfg(key)
+    if key == "points":
+        return ", ".join(v)
+    if key == "drinks":
+        return "; ".join(f"{n} {p}" for n, p in v)
+    if key == "promos":
+        return f"{len(v)} шт."
+    if key in TOGGLES:
+        return "✅ увімк." if v else "⛔ вимк."
+    return str(v)
+
+
+def settings_kb():
+    rows = []
+    for key, label in SETTING_ITEMS:
+        cb = f"stg:t:{key}" if key in TOGGLES else f"stg:e:{key}"
+        rows.append([InlineKeyboardButton(text=f"{label}: {setting_value(key)}"[:60], callback_data=cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+SETTING_HELP = {
+    "shop": "Напишіть назву закладу (до 40 символів).",
+    "stamps_goal": "Скільки штампів до подарунка? Число від 2 до 30.",
+    "passport_days": "За скільки днів треба обійти всі точки? Число від 1 до 60.",
+    "points": "Перелічіть точки через кому (від 2 до 6). Приклад: Кав'ярня, Будка №1, Будка №2.\n"
+              "Паспорт вимагає відвідати всі точки зі списку.",
+    "drinks": "Напої та ціни, кожен з нового рядка у форматі «Назва - ціна». Приклад:\nЕспресо - 45\nЛате - 75",
+    "promos": "Шаблони акцій — кожен з нового рядка (від 1 до 6, до 150 символів).",
+    "quiet": "Тихі години, коли в закладі мало людей. Формат «11-14» (години від 0 до 23).",
+    "promo_time": "О котрій надсилати заплановану акцію? Формат «10:30».",
+    "maps_url": "Посилання на сторінку закладу в Google Maps (починається з http).",
+}
+
+
+def parse_setting(key, text):
+    """Повертає (ок, значення або текст помилки)."""
+    t = text.strip()
+    try:
+        if key == "shop":
+            return (True, t[:40]) if t else (False, "Назва не може бути порожньою.")
+        if key in ("stamps_goal", "passport_days"):
+            lo, hi = (2, 30) if key == "stamps_goal" else (1, 60)
+            n = int(t)
+            return (True, n) if lo <= n <= hi else (False, f"Потрібне число від {lo} до {hi}.")
+        if key == "points":
+            ps = [x.strip()[:30] for x in t.replace("\n", ",").split(",") if x.strip()]
+            if len(set(ps)) != len(ps) or not 2 <= len(ps) <= 6:
+                return False, "Потрібно від 2 до 6 різних точок."
+            return True, ps
+        if key == "drinks":
+            out = []
+            for line in t.splitlines():
+                if not line.strip():
+                    continue
+                name, price = line.rsplit("-", 1) if "-" in line else line.rsplit(" ", 1)
+                out.append([name.strip()[:30], int(price.strip())])
+            return (True, out[:10]) if out else (False, "Додайте хоча б один напій.")
+        if key == "promos":
+            ps = [x.strip()[:150] for x in t.splitlines() if x.strip()]
+            return (True, ps[:6]) if ps else (False, "Додайте хоча б один шаблон.")
+        if key == "quiet":
+            a, b = (int(x) for x in t.replace("–", "-").split("-"))
+            return (True, (a, b)) if 0 <= a < b <= 23 else (False, "Приклад: 11-14 (початок менший за кінець).")
+        if key == "promo_time":
+            h, mi = (int(x) for x in t.split(":"))
+            return (True, f"{h:02d}:{mi:02d}") if 0 <= h <= 23 and 0 <= mi <= 59 else (False, "Приклад: 10:30.")
+        if key == "maps_url":
+            return (True, t) if t.startswith("http") else (False, "Посилання має починатися з http.")
+    except (ValueError, IndexError):
+        return False, "Не вдалося розібрати. Перевірте формат за прикладом."
+    return False, "Невідоме налаштування."
+
+
+@router.message(F.text == O_SETTINGS, owner_only)
+async def settings_menu(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("⚙️ <b>Налаштування</b>\nНатисніть пункт, щоб змінити. Нагороди — окремою кнопкою «🎁 Нагороди».",
+                   reply_markup=settings_kb())
+
+
+@router.callback_query(F.data.startswith("stg:"))
+async def settings_cb(c: CallbackQuery, state: FSMContext):
+    if not can_owner(c.from_user.id):
+        await c.answer("Недоступно", show_alert=True)
+        return
+    _, act, key = c.data.split(":")
+    if act == "t" and key in TOGGLES:
+        st.d["settings"][key] = not st.cfg(key)
+        st.save()
+        await c.message.edit_reply_markup(reply_markup=settings_kb())
+    elif act == "e" and key in SETTING_HELP:
+        await state.set_state(Setting.entry)
+        await state.update_data(key=key)
+        cur = "\n".join(st.cfg(key)) if key == "promos" else (
+            "\n".join(f"{n} - {p}" for n, p in st.cfg(key)) if key == "drinks" else setting_value(key))
+        await c.message.answer(f"{SETTING_HELP[key]}\n\nЗараз:\n{esc(cur)}")
+    await c.answer()
+
+
+@router.message(Setting.entry, ~F.text.in_(ALL_BTNS))
+async def settings_save(m: Message, state: FSMContext):
+    key = (await state.get_data()).get("key")
+    ok, val = parse_setting(key, m.text or "")
+    if not ok:
+        await m.answer(f"⚠️ {val}\nСпробуйте ще раз або натисніть будь-яку кнопку меню, щоб скасувати.")
+        return
+    await state.clear()
+    if key == "quiet":
+        st.d["settings"]["quiet_from"], st.d["settings"]["quiet_to"] = val
+    else:
+        st.d["settings"][key] = val
+    st.save()
+    await m.answer("✅ Збережено.", reply_markup=settings_kb())
+
+
 # ---------- тижневий розбір ----------
-def next_slot(wd: int, hour=10, minute=30):
+def quiet_text():
+    return f"{st.cfg('quiet_from'):02d}:00–{st.cfg('quiet_to'):02d}:00"
+
+
+def next_slot(wd: int, hour=None, minute=None):
+    if hour is None:
+        hour, minute = (int(x) for x in st.cfg("promo_time").split(":"))
     """Найближчий (майбутній) день тижня wd о hour:minute за київським часом."""
     now = datetime.now(TZ)
     d = now + timedelta(days=(wd - now.weekday()) % 7)
@@ -779,7 +1058,7 @@ def next_slot(wd: int, hour=10, minute=30):
 
 
 def promo_for(wd: int):
-    return f"☕ У {WD_ACC[wd]} з 11:00 до 14:00 — друга кава за пів ціни. Покажіть це повідомлення бариста."
+    return f"☕ У {WD_ACC[wd]} з {st.cfg('quiet_from'):02d}:00 до {st.cfg('quiet_to'):02d}:00 — друга кава за пів ціни. Покажіть це повідомлення бариста."
 
 
 def build_review():
@@ -790,7 +1069,7 @@ def build_review():
     drop = round((1 - w["weak"] / w["other"]) * 100)
     src = "демо-дані" if not w["real"] else f"демо-дані + {w['real']} реальних візитів"
     text = (f"🗓 <b>Розбір тижня</b>\n"
-            f"Найслабший час: <b>{WD[wd]} 11:00–14:00</b>.\n"
+            f"Найслабший час: <b>{WD[wd]} {quiet_text()}</b>.\n"
             f"Візитів на день у середньому: {w['weak']:.0f} проти {w['other']:.0f} в інші дні (−{drop}%).\n"
             f"<i>Основа: журнал візитів за 4 тижні ({src}).</i>\n\n"
             f"Пропоную акцію:\n«{esc(promo_for(wd))}»")
@@ -855,7 +1134,7 @@ async def scheduler(bot: Bot):
                     log.info("scheduled promo: sent=%s", await broadcast(bot, x["text"]))
             n = datetime.now(TZ)
             key = n.strftime("%Y-%m-%d")
-            if n.weekday() == 0 and n.hour == 9 and st.d.get("weekly_sent") != key:
+            if st.cfg("weekly_on") and n.weekday() == 0 and n.hour == 9 and st.d.get("weekly_sent") != key:
                 st.d["weekly_sent"] = key
                 st.save()
                 r = build_review()
@@ -874,8 +1153,8 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
     me = await bot.get_me()
-    global BOT_USERNAME
-    BOT_USERNAME = me.username
+    global BOT_USERNAME, _BOT
+    BOT_USERNAME, _BOT = me.username, bot
     try:
         log.info("qr self-test ok: %d bytes", len(qr_png(f"https://t.me/{BOT_USERNAME}?start=c_test")))
     except Exception:
