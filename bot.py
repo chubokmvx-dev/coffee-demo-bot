@@ -1,5 +1,5 @@
 """Демо-бот для кав'ярні: клієнтський режим + режим власника в одному боті."""
-import asyncio, html, io, logging, os, time
+import asyncio, html, io, logging, os, re, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -60,9 +60,10 @@ O_REDEEM, O_REPORT = "🎁 Погасити подарунок", "📊 Звіт"
 O_WEEK, O_POINT, O_REWARDS = "🗓 Розбір тижня", "📍 Змінити точку", "🎁 Нагороди"
 O_SETTINGS, O_STAFF, B_ORDERS = "⚙️ Налаштування", "👥 Персонал", "🧾 Замовлення"
 B_TO_BARISTA = "👨‍🍳 Режим бариста"
+O_AVAIL = "📦 Наявність"
 ALL_BTNS = {B_STAMPS, B_GIFTS, B_ORDER, B_POINTS, B_REVIEW, B_CODE, B_TO_OWNER, B_TO_CLIENT,
             B_USUAL, B_PREFS, B_PASS, O_PROMO, O_BACK, O_STAMP, O_REDEEM, O_REPORT, O_WEEK, O_POINT,
-            B_MENU_ORDER, B_INFO, O_REWARDS, O_PROMO_OLD, O_SETTINGS, O_STAFF, B_ORDERS, B_TO_BARISTA}
+            B_MENU_ORDER, B_INFO, O_REWARDS, O_PROMO_OLD, O_SETTINGS, O_STAFF, B_ORDERS, B_TO_BARISTA, O_AVAIL}
 
 
 def rk(rows):
@@ -79,12 +80,12 @@ def client_kb(uid):
 
 
 def owner_kb():
-    return rk([[O_PROMO, O_BACK], [O_STAMP, O_REDEEM], [B_ORDERS, O_POINT], [O_WEEK, O_REPORT],
-               [O_REWARDS, O_SETTINGS], [O_STAFF, B_TO_CLIENT]])
+    return rk([[O_PROMO, O_BACK], [O_STAMP, O_REDEEM], [B_ORDERS, O_AVAIL], [O_POINT, O_WEEK], [O_REPORT, O_REWARDS],
+               [O_SETTINGS, O_STAFF], [B_TO_CLIENT]])
 
 
 def barista_kb():
-    return rk([[O_STAMP, O_REDEEM], [B_ORDERS, O_POINT], [B_TO_CLIENT]])
+    return rk([[O_STAMP, O_REDEEM], [B_ORDERS, O_AVAIL], [O_POINT, B_TO_CLIENT]])
 
 
 def staff_kb(uid):
@@ -343,7 +344,7 @@ async def order_menu(m: Message, state: FSMContext):
     rows = []
     last = u.get("last")
     if last:
-        rows.append([InlineKeyboardButton(text=f"🔁 Як завжди: {drink(last['drink'])[0]}", callback_data="mn:usual")])
+        rows.append([InlineKeyboardButton(text=f"🔁 Як завжди: {usual_label(u)}"[:60], callback_data="mn:usual")])
     rows.append([InlineKeyboardButton(text="🆕 Нове замовлення", callback_data="mn:new")])
     rows.append([InlineKeyboardButton(text="✍️ Вподобання" + (" ✓" if u.get("prefs") else ""), callback_data="mn:prefs")])
     await m.answer("☕ Що робимо?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -364,7 +365,8 @@ async def menu_cb(c: CallbackQuery, state: FSMContext):
     if act == "usual":
         await show_usual(c.message, c.from_user)
     elif act == "new":
-        await show_drinks(c.message)
+        await state.clear()
+        await start_order(c.message, c.from_user, state)
     elif act == "prefs":
         await ask_prefs(c.message, c.from_user, state)
     elif act == "points":
@@ -374,66 +376,258 @@ async def menu_cb(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-# --- предзамовлення ---
-async def show_drinks(msg: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"od:{i}")] for i, (n, p) in enumerate(drinks())])
-    await msg.answer("Що замовити?", reply_markup=kb)
+# --- конструктор замовлення: точка → напій → молоко → сироп → десерт → час ---
+CATS = {"milks": "🥛 Молоко", "syrups": "🍯 Сиропи", "desserts": "🍰 Десерти", "drinks": "☕ Напої"}
+
+
+def price_of(cat, name):
+    for n, p in st.cfg(cat):
+        if n == name:
+            return p
+    return None
+
+
+def avail(cat, point):
+    """Позиції категорії, які є на точці: [(індекс, назва, ціна)]."""
+    return [(i, n, p) for i, (n, p) in enumerate(st.cfg(cat)) if st.is_on(cat, n, point)]
+
+
+def extra(p):
+    return f" +{p} грн" if p else ""
+
+
+def cart_total(cart):
+    total = price_of("drinks", cart["dr"]) or 0
+    if cart.get("ml"):
+        total += price_of("milks", cart["ml"]) or 0
+    total += sum(price_of("syrups", x) or 0 for x in cart.get("sy", []))
+    total += sum(price_of("desserts", x) or 0 for x in cart.get("ds", []))
+    return total
+
+
+def cart_lines(cart):
+    out = [f"☕ <b>{esc(cart['dr'])}</b> · {price_of('drinks', cart['dr'])} грн"]
+    if cart.get("ml"):
+        out.append(f"🥛 {esc(cart['ml'])}{extra(price_of('milks', cart['ml']))}")
+    for x in cart.get("sy", []):
+        out.append(f"🍯 {esc(x)}{extra(price_of('syrups', x))}")
+    for x in cart.get("ds", []):
+        out.append(f"🍰 {esc(x)} · {price_of('desserts', x)} грн")
+    return out
+
+
+def cart_details(cart):
+    """Коротко для бариста: усе, крім самого напою."""
+    parts = []
+    if cart.get("ml"):
+        parts.append(f"молоко: {cart['ml']}")
+    if cart.get("sy"):
+        parts.append("сироп: " + ", ".join(cart["sy"]))
+    if cart.get("ds"):
+        parts.append("десерт: " + ", ".join(cart["ds"]))
+    return "; ".join(parts)
+
+
+def step_has_options(cart, step):
+    if step == "milk":
+        return bool(avail("milks", cart["pt"]))
+    if step == "syrup":
+        return bool(avail("syrups", cart["pt"]))
+    if step == "dessert":
+        return bool(avail("desserts", cart["pt"]))
+    return True
+
+
+def next_step(cart, cur):
+    order = ["drink", "milk", "syrup", "dessert", "time", "confirm"]
+    for st_ in order[order.index(cur) + 1:]:
+        if step_has_options(cart, st_):
+            return st_
+    return "confirm"
+
+
+def kb_rows(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def render_step(msg: Message, cart: dict, step: str, edit=True):
+    pt = cart["pt"]
+    head = f"📍 {esc(pt)}\n"
+    if cart.get("dr"):
+        head += "\n".join(cart_lines(cart)) + "\n"
+    head += "\n"
+    if step == "drink":
+        items = avail("drinks", pt)
+        text = f"📍 {esc(pt)}\n\n☕ <b>Що замовити?</b>" if items else f"📍 {esc(pt)}\n\nНа цій точці зараз немає напоїв."
+        rows = [[InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"o:dr:{i}")] for i, n, p in items]
+    elif step == "milk":
+        text = head + "🥛 <b>Яке молоко?</b>"
+        rows = [[InlineKeyboardButton(text="Звичайне (без доплати)", callback_data="o:ml:x")]]
+        rows += [[InlineKeyboardButton(text=f"{n}{extra(p)}", callback_data=f"o:ml:{i}")] for i, n, p in avail("milks", pt)]
+    elif step == "syrup":
+        text = head + "🍯 <b>Додати сироп?</b> Можна кілька або пропустити."
+        rows = [[InlineKeyboardButton(text=f"{'✅' if n in cart['sy'] else '⬜'} {n}{extra(p)}", callback_data=f"o:sy:{i}")]
+                for i, n, p in avail("syrups", pt)]
+        rows.append([InlineKeyboardButton(text="Далі ➡️", callback_data="o:sy:ok")])
+    elif step == "dessert":
+        text = head + "🍰 <b>Смачна пара до кави?</b> Можна додати десерт або пропустити."
+        rows = [[InlineKeyboardButton(text=f"{'✅' if n in cart['ds'] else '⬜'} {n} — {p} грн", callback_data=f"o:ds:{i}")]
+                for i, n, p in avail("desserts", pt)]
+        rows.append([InlineKeyboardButton(text="Далі ➡️", callback_data="o:ds:ok")])
+    elif step == "time":
+        text = head + "⏱ <b>Коли забрати?</b>"
+        rows = [[InlineKeyboardButton(text=f"через {t} хв", callback_data=f"o:tm:{t}") for t in (5, 10, 15)]]
+    else:
+        text = head + f"⏱ через {cart['tm']} хв\n\n💰 <b>Разом: {cart_total(cart)} грн</b>"
+        rows = [[InlineKeyboardButton(text="✅ Замовити", callback_data="o:go")],
+                [InlineKeyboardButton(text="↩️ Почати спочатку", callback_data="o:back")]]
+    if edit:
+        await msg.edit_text(text, reply_markup=kb_rows(rows))
+    else:
+        await msg.answer(text, reply_markup=kb_rows(rows))
+
+
+async def start_order(msg: Message, user, state: FSMContext):
+    """Крок 0: точка (якщо точок кілька). Запам'ятовує останню точку першою."""
+    u, _ = st.ensure(user.id, user.full_name)
+    ps = points()
+    last_pt = (u.get("last") or {}).get("p")
+    order = sorted(ps, key=lambda p: p != last_pt)
+    if len(ps) == 1:
+        cart = {"pt": ps[0], "dr": None, "ml": None, "sy": [], "ds": []}
+        await state.update_data(cart=cart)
+        await render_step(msg, cart, "drink", edit=False)
+        return
+    rows = [[InlineKeyboardButton(text=f"📍 {p}", callback_data=f"o:pt:{ps.index(p)}")] for p in order]
+    await msg.answer("Де заберете замовлення?", reply_markup=kb_rows(rows))
 
 
 @router.message(F.text == B_ORDER)
 async def order_start(m: Message, state: FSMContext):
     await state.clear()
-    await show_drinks(m)
+    await start_order(m, m.from_user, state)
 
 
-@router.callback_query(F.data.startswith("od:"))
-async def order_time(c: CallbackQuery):
-    i = int(c.data.split(":")[1])
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"через {t} хв", callback_data=f"ot:{i}:{t}") for t in (5, 10, 15)]])
-    await c.message.edit_text(f"<b>{drink(i)[0]}</b>. Коли забрати?", reply_markup=kb)
+@router.callback_query(F.data.startswith("o:"))
+async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
+    parts = c.data.split(":")
+    act = parts[1]
+    arg = parts[2] if len(parts) > 2 else None
+    cart = (await state.get_data()).get("cart")
+    if act == "pt":
+        cart = {"pt": point_at(int(arg)), "dr": None, "ml": None, "sy": [], "ds": []}
+        await state.update_data(cart=cart)
+        await render_step(c.message, cart, "drink")
+        await c.answer()
+        return
+    if not cart:
+        await c.answer("Сесія закінчилась — почніть замовлення спочатку.", show_alert=True)
+        return
+    pt = cart["pt"]
+    try:
+        if act == "dr":
+            item = next((n for i, n, p in avail("drinks", pt) if i == int(arg)), None)
+            if not item:
+                await c.answer("Цього напою зараз немає.", show_alert=True)
+                return
+            cart["dr"] = item
+            step = next_step(cart, "drink")
+        elif act == "ml":
+            cart["ml"] = None if arg == "x" else next((n for i, n, p in avail("milks", pt) if i == int(arg)), None)
+            step = next_step(cart, "milk")
+        elif act in ("sy", "ds"):
+            key, cat, cur = ("sy", "syrups", "syrup") if act == "sy" else ("ds", "desserts", "dessert")
+            if arg == "ok":
+                step = next_step(cart, cur)
+            else:
+                name = next((n for i, n, p in avail(cat, pt) if i == int(arg)), None)
+                if name:
+                    cart[key] = [x for x in cart[key] if x != name] if name in cart[key] else cart[key] + [name]
+                step = cur
+        elif act == "tm":
+            cart["tm"] = int(arg)
+            step = "confirm"
+        elif act == "back":
+            cart.update({"dr": None, "ml": None, "sy": [], "ds": []})
+            step = "drink"
+        elif act == "go":
+            if not cart.get("dr") or not cart.get("tm"):
+                await c.answer("Замовлення неповне.", show_alert=True)
+                return
+            text = await place_order(bot, c.from_user, cart)
+            await state.update_data(cart=None)
+            await c.message.edit_text(text)
+            await c.answer()
+            return
+        else:
+            await c.answer()
+            return
+    except (ValueError, TypeError):
+        await c.answer("Меню змінилось, почніть спочатку.", show_alert=True)
+        return
+    await state.update_data(cart=cart)
+    await render_step(c.message, cart, step)
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("ot:"))
-async def order_point(c: CallbackQuery):
-    _, i, t = c.data.split(":")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=p, callback_data=f"op:{i}:{t}:{k}")] for k, p in enumerate(points())])
-    await c.message.edit_text("Де забрати?", reply_markup=kb)
-    await c.answer()
-
-
-async def place_order(bot: Bot, user, i: int, t: int, k: int, usual=False):
-    """Створює замовлення, зберігає його як «останнє» і сповіщає власника. Повертає текст для клієнта."""
-    name, price = drink(i)
-    point = point_at(k)
+async def place_order(bot: Bot, user, cart: dict, usual=False):
+    """Створює замовлення, зберігає його як «як завжди» і сповіщає бариста. Повертає текст клієнту."""
     u, _ = st.ensure(user.id, user.full_name)
-    n = st.add_order(user.id, name, price, t, point)
-    u["last"] = {"drink": i, "point": k}
+    total = cart_total(cart)
+    details = cart_details(cart)
+    n = st.add_order(user.id, cart["dr"], total, cart["tm"], cart["pt"], details)
+    u["last"] = {"d": cart["dr"], "p": cart["pt"], "m": cart.get("ml"), "s": list(cart.get("sy", []))}
     st.save()
     touch(user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Готово", callback_data=f"rd:{n}")]])
+    kb = kb_rows([[InlineKeyboardButton(text="✅ Готово", callback_data=f"rd:{n}")]])
     note = ("\n🔁 Постійний клієнт: «як завжди»" if usual else "")
     if u.get("prefs"):
         note += f"\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
-    for o in order_recipients(point):
-        await safe_send(bot, o, f"🆕 <b>Замовлення №{n}</b>\n{name} · {price} грн\n📍 {esc(point)} · через {t} хв\n"
+    body = "\n".join(cart_lines(cart))
+    for o in order_recipients(cart["pt"]):
+        await safe_send(bot, o, f"🆕 <b>Замовлення №{n}</b> · {total} грн\n{body}\n📍 {esc(cart['pt'])} · через {cart['tm']} хв\n"
                                 f"Клієнт: {esc(user.full_name)}{note}", reply_markup=kb)
-    return (f"✅ Замовлення №{n} прийнято\n<b>{name}</b> · {price} грн\n"
-            f"📍 {esc(point)} · через {t} хв\nМи напишемо, коли буде готово.")
-
-
-@router.callback_query(F.data.startswith("op:"))
-async def order_done(c: CallbackQuery, bot: Bot):
-    _, i, t, k = c.data.split(":")
-    text = await place_order(bot, c.from_user, int(i), int(t), int(k))
-    await c.message.edit_text(text)
-    await c.answer()
+    return (f"✅ Замовлення №{n} прийнято\n{body}\n💰 Разом: <b>{total} грн</b>\n"
+            f"📍 {esc(cart['pt'])} · через {cart['tm']} хв\nМи напишемо, коли буде готово.")
 
 
 # --- «Як завжди» ---
+def usual_cart(u):
+    """Збережене «як завжди» → кошик. Підтримує старий формат (індекси)."""
+    last = u.get("last")
+    if not last:
+        return None
+    if "d" in last:
+        return {"pt": last["p"], "dr": last["d"], "ml": last.get("m"), "sy": list(last.get("s", [])), "ds": []}
+    ds = drinks()
+    if isinstance(last.get("drink"), int) and last["drink"] < len(ds):
+        return {"pt": point_at(last.get("point", 0)), "dr": ds[last["drink"]][0], "ml": None, "sy": [], "ds": []}
+    return None
+
+
+def usual_missing(cart):
+    """Що з «як завжди» зараз недоступно (прибрано з меню або немає на точці)."""
+    bad = []
+    if cart["pt"] not in points():
+        return [f"точка «{cart['pt']}»"]
+    pt = cart["pt"]
+    if price_of("drinks", cart["dr"]) is None or not st.is_on("drinks", cart["dr"], pt):
+        bad.append(cart["dr"])
+    if cart["ml"] and (price_of("milks", cart["ml"]) is None or not st.is_on("milks", cart["ml"], pt)):
+        bad.append(cart["ml"])
+    for x in cart["sy"]:
+        if price_of("syrups", x) is None or not st.is_on("syrups", x, pt):
+            bad.append(x)
+    return bad
+
+
+def usual_label(u):
+    c = usual_cart(u)
+    if not c:
+        return None
+    return c["dr"] + (f" + {c['ml']}" if c["ml"] else "") + (f" + {', '.join(c['sy'])}" if c["sy"] else "")
+
+
 @router.message(F.text == B_USUAL)
 async def usual_start(m: Message, state: FSMContext):
     await state.clear()
@@ -442,26 +636,30 @@ async def usual_start(m: Message, state: FSMContext):
 
 async def show_usual(m: Message, user):
     u, _ = st.ensure(user.id, user.full_name)
-    last = u.get("last")
-    if not last:
-        await m.answer(f"Ви ще нічого не замовляли. Зробіть перше замовлення через «{B_ORDER}» — "
+    cart = usual_cart(u)
+    if not cart:
+        await m.answer(f"Ви ще нічого не замовляли. Зробіть перше замовлення через «{B_MENU_ORDER}» — "
                        f"далі «Як завжди» повторить його одним дотиком.")
         return
-    name, price = drink(last["drink"])
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"через {t} хв", callback_data=f"uz:{t}") for t in (5, 10, 15)]])
-    await m.answer(f"🔁 Як завжди: <b>{name}</b> · {price} грн\n📍 {esc(point_at(last['point']))}\nКоли забрати?",
-                   reply_markup=kb)
+    bad = usual_missing(cart)
+    if bad:
+        kb = kb_rows([[InlineKeyboardButton(text="🆕 Нове замовлення", callback_data="mn:new")]])
+        await m.answer(f"На жаль, зараз недоступно: <b>{esc(', '.join(bad))}</b>. Оформіть нове замовлення.", reply_markup=kb)
+        return
+    kb = kb_rows([[InlineKeyboardButton(text=f"через {t} хв", callback_data=f"uz:{t}") for t in (5, 10, 15)]])
+    await m.answer("🔁 <b>Як завжди</b>\n" + "\n".join(cart_lines(cart)) + f"\n📍 {esc(cart['pt'])}\n"
+                   f"💰 Разом: <b>{cart_total(cart)} грн</b>\nКоли забрати?", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("uz:"))
 async def usual_go(c: CallbackQuery, bot: Bot):
     u, _ = st.ensure(c.from_user.id, c.from_user.full_name)
-    last = u.get("last")
-    if not last:
-        await c.answer("Немає останнього замовлення", show_alert=True)
+    cart = usual_cart(u)
+    if not cart or usual_missing(cart):
+        await c.answer("Меню змінилось — оформіть нове замовлення.", show_alert=True)
         return
-    text = await place_order(bot, c.from_user, last["drink"], int(c.data.split(":")[1]), last["point"], usual=True)
+    cart["tm"] = int(c.data.split(":")[1])
+    text = await place_order(bot, c.from_user, cart, usual=True)
     await c.message.edit_text(text)
     await c.answer()
 
@@ -862,8 +1060,69 @@ async def open_orders(m: Message, state: FSMContext):
         cu = st.user(o["uid"]) or {}
         note = f"\n📝 {esc(cu['prefs'])}" if cu.get("prefs") else ""
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Готово", callback_data=f"rd:{n}")]])
-        await m.answer(f"🧾 <b>№{n}</b> · {o['drink']} · {o['price']} грн\n📍 {esc(o['point'])} · через {o['min']} хв · "
+        det = f"\n➕ {esc(o['details'])}" if o.get("details") else ""
+        await m.answer(f"🧾 <b>№{n}</b> · {esc(o['drink'])} · {o['price']} грн{det}\n📍 {esc(o['point'])} · через {o['min']} хв · "
                        f"{esc(cu.get('name', ''))}{note}", reply_markup=kb)
+
+
+# ---------- наявність (бариста й власник; окремо для кожної точки) ----------
+def avail_point(uid):
+    u = st.user(uid) or {}
+    p = u.get("point")
+    return p if p in points() else points()[0]
+
+
+def avail_menu_kb():
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"av:c:{cat}")] for cat, label in CATS.items()]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def avail_cat_kb(cat, point):
+    rows = []
+    for i, (n, p) in enumerate(st.cfg(cat)):
+        mark = "✅" if st.is_on(cat, n, point) else "❌"
+        rows.append([InlineKeyboardButton(text=f"{mark} {n}{extra(p) if cat != 'desserts' and cat != 'drinks' else ' · ' + str(p) + ' грн'}"[:60],
+                                          callback_data=f"av:t:{cat}:{i}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="av:m")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+AVAIL_TXT = "📦 <b>Наявність на точці: {p}</b>\nОберіть розділ. Те, що вимкнено, клієнти не побачать у замовленні. " \
+            "Змінити точку — кнопка «📍 Змінити точку»."
+
+
+@router.message(F.text == O_AVAIL, staff_only)
+async def avail_open(m: Message, state: FSMContext):
+    await state.clear()
+    st.ensure(m.from_user.id, m.from_user.full_name)
+    await m.answer(AVAIL_TXT.format(p=esc(avail_point(m.from_user.id))), reply_markup=avail_menu_kb())
+
+
+@router.callback_query(F.data.startswith("av:"))
+async def avail_cb(c: CallbackQuery):
+    if not can_staff(c.from_user.id):
+        await c.answer("Недоступно", show_alert=True)
+        return
+    parts = c.data.split(":")
+    pt = avail_point(c.from_user.id)
+    if parts[1] == "m":
+        await c.message.edit_text(AVAIL_TXT.format(p=esc(pt)), reply_markup=avail_menu_kb())
+    elif parts[1] == "c" and parts[2] in CATS:
+        cat = parts[2]
+        if not st.cfg(cat):
+            await c.answer("Список порожній — власник додає позиції в налаштуваннях.", show_alert=True)
+            return
+        await c.message.edit_text(f"{CATS[cat]} · <b>{esc(pt)}</b>\nНатисніть, щоб вмикати/вимикати. ✅ є, ❌ немає.",
+                                  reply_markup=avail_cat_kb(cat, pt))
+    elif parts[1] == "t" and parts[2] in CATS:
+        cat, i = parts[2], int(parts[3])
+        items = st.cfg(cat)
+        if i >= len(items):
+            await c.answer("Список змінився, відкрийте розділ знову.", show_alert=True)
+            return
+        st.toggle(cat, items[i][0], pt)
+        await c.message.edit_reply_markup(reply_markup=avail_cat_kb(cat, pt))
+    await c.answer()
 
 
 # ---------- персонал ----------
@@ -912,10 +1171,12 @@ async def staff_cb(c: CallbackQuery):
 SETTING_ITEMS = [
     ("shop", "🏷 Назва закладу"), ("stamps_goal", "☕ Штампів до подарунка"),
     ("passport_days", "🧭 Паспорт: днів"), ("points", "📍 Точки"), ("drinks", "🍵 Напої та ціни"),
+    ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
     ("maps_url", "⭐ Google Maps"), ("weekly_on", "🗓 Тижневий розбір"), ("welcome_on", "🎁 Вітальний подарунок"),
 ]
 TOGGLES = {"weekly_on", "welcome_on"}
+PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
 
 
 class Setting(StatesGroup):
@@ -928,8 +1189,8 @@ def setting_value(key):
     v = st.cfg(key)
     if key == "points":
         return ", ".join(v)
-    if key == "drinks":
-        return "; ".join(f"{n} {p}" for n, p in v)
+    if key in PRICE_KEYS:
+        return "; ".join(f"{n} {p}" for n, p in v) if v else "немає"
     if key == "promos":
         return f"{len(v)} шт."
     if key in TOGGLES:
@@ -952,11 +1213,20 @@ SETTING_HELP = {
     "points": "Перелічіть точки через кому (від 2 до 6). Приклад: Кав'ярня, Будка №1, Будка №2.\n"
               "Паспорт вимагає відвідати всі точки зі списку.",
     "drinks": "Напої та ціни, кожен з нового рядка у форматі «Назва - ціна». Приклад:\nЕспресо - 45\nЛате - 75",
+    "milks": "Види молока й доплата, кожен з нового рядка: «Назва - доплата». Приклад:\nБананове - 25\nКокосове - 20\n"
+             "Щоб прибрати крок молока — надішліть «-». Що є в наявності сьогодні, відмічає бариста кнопкою «📦 Наявність».",
+    "syrups": "Сиропи й доплата, кожен з нового рядка: «Назва - доплата». Приклад:\nКарамель - 10\nВаніль - 10\n"
+              "Щоб прибрати крок сиропів — надішліть «-».",
+    "desserts": "Десерти й ціни, кожен з нового рядка: «Назва - ціна». Приклад:\nКруасан - 55\nЧізкейк - 85\n"
+                "Щоб прибрати десерти з замовлення — надішліть «-».",
     "promos": "Шаблони акцій — кожен з нового рядка (від 1 до 6, до 150 символів).",
     "quiet": "Тихі години, коли в закладі мало людей. Формат «11-14» (години від 0 до 23).",
     "promo_time": "О котрій надсилати заплановану акцію? Формат «10:30».",
     "maps_url": "Посилання на сторінку закладу в Google Maps (починається з http).",
 }
+
+
+PRICE_LINE = re.compile(r"^(.*?)[\s\-–—:=]*\+?\s*(\d+)\s*(?:грн)?\s*$")
 
 
 def parse_setting(key, text):
@@ -974,14 +1244,27 @@ def parse_setting(key, text):
             if len(set(ps)) != len(ps) or not 2 <= len(ps) <= 6:
                 return False, "Потрібно від 2 до 6 різних точок."
             return True, ps
-        if key == "drinks":
+        if key in PRICE_KEYS:
+            if key != "drinks" and t in ("-", "–", "—", "0"):
+                return True, []
             out = []
             for line in t.splitlines():
                 if not line.strip():
                     continue
-                name, price = line.rsplit("-", 1) if "-" in line else line.rsplit(" ", 1)
-                out.append([name.strip()[:30], int(price.strip())])
-            return (True, out[:10]) if out else (False, "Додайте хоча б один напій.")
+                mt = PRICE_LINE.match(line.strip())
+                if not mt or not mt.group(1).strip():
+                    return False, f"Не вдалося розібрати рядок: «{line.strip()[:40]}». Формат: Назва - ціна."
+                name, price = mt.group(1).strip()[:30], int(mt.group(2))
+                if key == "drinks" and price < 1:
+                    return False, "Ціна напою має бути більшою за 0."
+                if price > 9999:
+                    return False, "Задто велика ціна."
+                out.append([name, price])
+            if len({n for n, _ in out}) != len(out):
+                return False, "Назви мають бути різними."
+            if not out:
+                return False, "Додайте хоча б одну позицію (або «-», щоб прибрати розділ)." if key != "drinks" else "Додайте хоча б один напій."
+            return True, out[:12]
         if key == "promos":
             ps = [x.strip()[:150] for x in t.splitlines() if x.strip()]
             return (True, ps[:6]) if ps else (False, "Додайте хоча б один шаблон.")
@@ -1019,7 +1302,7 @@ async def settings_cb(c: CallbackQuery, state: FSMContext):
         await state.set_state(Setting.entry)
         await state.update_data(key=key)
         cur = "\n".join(st.cfg(key)) if key == "promos" else (
-            "\n".join(f"{n} - {p}" for n, p in st.cfg(key)) if key == "drinks" else setting_value(key))
+            "\n".join(f"{n} - {p}" for n, p in st.cfg(key)) or "-" if key in PRICE_KEYS else setting_value(key))
         await c.message.answer(f"{SETTING_HELP[key]}\n\nЗараз:\n{esc(cur)}")
     await c.answer()
 

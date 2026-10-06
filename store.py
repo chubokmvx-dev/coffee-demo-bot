@@ -10,7 +10,11 @@ DEFAULT_SETTINGS = {
     "stamps_goal": 8,
     "passport_days": 7,
     "points": ["Кав'ярня", "Будка №1", "Будка №2"],
-    "drinks": [["Еспресо", 45], ["Американо", 55], ["Капучино", 70], ["Лате", 75]],
+    "drinks": [["Еспресо", 45], ["Американо", 55], ["Капучино", 70], ["Лате", 75], ["Допіо", 60], ["Флет-вайт", 85]],
+    # доплати / ціни нижче — демо-значення, власник змінює їх у налаштуваннях
+    "milks": [["Бананове", 25], ["Кокосове", 20], ["Мигдалеве", 15]],
+    "syrups": [["Карамель", 10], ["Ваніль", 10], ["Фундук", 10]],
+    "desserts": [["Круасан", 55], ["Чізкейк", 85], ["Брауні", 60]],
     "promos": [
         "☕ Друга кава за пів ціни до 14:00! Покажіть це повідомлення бариста.",
         "🥐 Лате + круасан за 99 грн, тільки з 11:00 до 14:00.",
@@ -36,7 +40,7 @@ WD_ACC = ["понеділок", "вівторок", "середу", "четве�
 def _empty():
     return {"users": {}, "orders": {}, "next_order": 1, "seeded": False, "promos": 0, "reviews": [],
             "log": [], "scheduled": [], "weekly_sent": "", "seeded_log": False,
-            "rewards": dict(DEFAULT_REWARDS), "settings": {}, "invites": {}}
+            "rewards": dict(DEFAULT_REWARDS), "settings": {}, "invites": {}, "off": {}}
 
 
 class Store:
@@ -51,6 +55,8 @@ class Store:
             self.d.setdefault(k, v)
         for k, v in DEFAULT_SETTINGS.items():
             self.d["settings"].setdefault(k, v)
+        if self.d["settings"]["drinks"] == [["Еспресо", 45], ["Американо", 55], ["Капучино", 70], ["Лате", 75]]:
+            self.d["settings"]["drinks"] = DEFAULT_SETTINGS["drinks"]      # старе демо-меню → нове
         for k, v in DEFAULT_REWARDS.items():
             self.d["rewards"].setdefault(k, v)
         for u in self.d["users"].values():     # міграція: раніше подарунки були числом
@@ -155,11 +161,28 @@ class Store:
         return [(int(k), u) for k, u in self.d["users"].items() if u["last_visit"] < lim]
 
     # --- замовлення ---
-    def add_order(self, uid, drink, price, minutes, point):
+    # --- наявність (окремо для кожної точки) ---
+    def is_on(self, cat, name, point):
+        return point not in self.d["off"].get(f"{cat}:{name}", [])
+
+    def toggle(self, cat, name, point):
+        """Перемикає наявність позиції на точці. Повертає новий стан (True = є)."""
+        key = f"{cat}:{name}"
+        off = self.d["off"].setdefault(key, [])
+        if point in off:
+            off.remove(point)
+        else:
+            off.append(point)
+        if not off:
+            self.d["off"].pop(key, None)
+        self.save()
+        return self.is_on(cat, name, point)
+
+    def add_order(self, uid, drink, price, minutes, point, details=""):
         n = self.d["next_order"]
         self.d["next_order"] = n + 1
         self.d["orders"][str(n)] = {"uid": uid, "drink": drink, "price": price, "min": minutes,
-                                    "point": point, "ts": time.time(), "done": False}
+                                    "point": point, "ts": time.time(), "done": False, "details": details}
         self.save()
         return n
 
@@ -170,7 +193,9 @@ class Store:
         usual = "напій на вибір"
         last = (u or {}).get("last")
         names = [d[0] for d in self.cfg("drinks")]
-        if last and last["drink"] < len(names):
+        if last and last.get("d"):
+            usual = last["d"]
+        elif last and isinstance(last.get("drink"), int) and last["drink"] < len(names):
             usual = names[last["drink"]]
         return text.replace("{usual}", usual)
 
