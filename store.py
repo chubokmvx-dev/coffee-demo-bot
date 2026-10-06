@@ -28,6 +28,10 @@ DEFAULT_SETTINGS = {
     "weekly_on": True,
     "welcome_on": True,
     "promo_photo": True,
+    "order_max_active": 1,      # скільки незабраних замовлень одночасно може мати клієнт
+    "noshow_limit": 3,          # після скількох «не забрали» за 30 днів передзамовлення вимикаються (0 — не обмежувати)
+    "alert_stamps_hour": 12,    # сповіщення власнику, якщо один бариста поставив стільки штампів за годину (0 — вимкнено)
+    "alert_gifts_day": 5,       # ... або видав стільки подарунків за добу
     "stamp_confirm": True,      # штамп лише після підтвердження покупки від ціни найдешевшого напою
     "stamp_cooldown": 30,       # хвилин між двома штампами одному клієнту (власника не стосується)
     "stamp_daily_max": 3,       # штампів на день одному клієнту
@@ -173,6 +177,26 @@ class Store:
         return [(int(k), u) for k, u in self.d["users"].items() if u["last_visit"] < lim]
 
     # --- замовлення ---
+    # --- замовлення: ліміти й неявки ---
+    ORDER_LIFE = 3 * 3600       # після цього незакрите замовлення вважається застарілим (без штрафу клієнту)
+
+    def active_orders(self, uid):
+        lim = time.time() - self.ORDER_LIFE
+        return [(n, o) for n, o in self.d["orders"].items() if o["uid"] == uid and not o["done"] and o["ts"] > lim]
+
+    def noshow_count(self, u):
+        lim = time.time() - 30 * DAY
+        return sum(1 for ts in u.get("noshows", []) if ts > lim)
+
+    def expire_orders(self):
+        lim = time.time() - self.ORDER_LIFE
+        n = 0
+        for o in self.d["orders"].values():
+            if not o["done"] and o["ts"] <= lim:
+                o["done"], o["expired"] = True, True
+                n += 1
+        return n
+
     # --- журнал дій персоналу та захист від зловживань ---
     def log_action(self, kind, by, client, point, x=""):
         """kind: stamp | redeem | blocked."""

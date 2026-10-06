@@ -534,6 +534,10 @@ async def render_step(msg: Message, cart: dict, step: str, edit=True):
 async def start_order(msg: Message, user, state: FSMContext):
     """Крок 0: точка (якщо точок кілька). Запам'ятовує останню точку першою."""
     u, _ = st.ensure(user.id, user.full_name)
+    why = order_block(user.id)
+    if why:
+        await msg.answer(f"⏳ {why}")
+        return
     ps = points()
     last_pt = (u.get("last") or {}).get("p")
     order = sorted(ps, key=lambda p: p != last_pt)
@@ -598,6 +602,10 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
             if not cart.get("dr") or not cart.get("tm"):
                 await c.answer("Замовлення неповне.", show_alert=True)
                 return
+            why = order_block(c.from_user.id)
+            if why:
+                await c.answer(html.unescape(why)[:190], show_alert=True)
+                return
             text = await place_order(bot, c.from_user, cart)
             await state.update_data(cart=None)
             await c.message.edit_text(text)
@@ -614,6 +622,25 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
     await c.answer()
 
 
+def order_kb(n):
+    return kb_rows([[InlineKeyboardButton(text="✅ Готово", callback_data=f"rd:{n}"),
+                     InlineKeyboardButton(text="🚫 Не забрали", callback_data=f"nf:{n}")]])
+
+
+def order_block(uid):
+    """Причина, чому клієнт зараз не може оформити передзамовлення (або None)."""
+    u = st.user(uid) or {}
+    lim = st.cfg("noshow_limit")
+    if lim and st.noshow_count(u) >= lim:
+        return ("Передзамовлення для вас тимчасово вимкнено: кілька замовлень не забрали. "
+                "Замовте на касі — штампи й подарунки працюють як завжди.")
+    act = st.active_orders(uid)
+    if act and len(act) >= st.cfg("order_max_active"):
+        n, o = act[-1]
+        return f"У вас уже є активне замовлення №{n} ({esc(o['drink'])}, {esc(o['point'])}). Заберіть його, і зможете оформити нове."
+    return None
+
+
 async def place_order(bot: Bot, user, cart: dict, usual=False):
     """Створює замовлення, зберігає його як «як завжди» і сповіщає бариста. Повертає текст клієнту."""
     u, _ = st.ensure(user.id, user.full_name)
@@ -623,7 +650,7 @@ async def place_order(bot: Bot, user, cart: dict, usual=False):
     u["last"] = {"d": cart["dr"], "p": cart["pt"], "m": cart.get("ml"), "s": list(cart.get("sy", []))}
     st.save()
     touch(user.id)
-    kb = kb_rows([[InlineKeyboardButton(text="✅ Готово", callback_data=f"rd:{n}")]])
+    kb = order_kb(n)
     note = ("\n🔁 Постійний клієнт: «як завжди»" if usual else "")
     if u.get("prefs"):
         note += f"\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
@@ -680,6 +707,10 @@ async def usual_start(m: Message, state: FSMContext):
 
 async def show_usual(m: Message, user):
     u, _ = st.ensure(user.id, user.full_name)
+    why = order_block(user.id)
+    if why:
+        await m.answer(f"⏳ {why}")
+        return
     cart = usual_cart(u)
     if not cart:
         await m.answer(f"Ви ще нічого не замовляли. Зробіть перше замовлення через «{B_MENU_ORDER}» — "
@@ -701,6 +732,10 @@ async def usual_go(c: CallbackQuery, bot: Bot):
     cart = usual_cart(u)
     if not cart or usual_missing(cart):
         await c.answer("Меню змінилось — оформіть нове замовлення.", show_alert=True)
+        return
+    why = order_block(c.from_user.id)
+    if why:
+        await c.answer(html.unescape(why)[:190], show_alert=True)
         return
     cart["tm"] = int(c.data.split(":")[1])
     text = await place_order(bot, c.from_user, cart, usual=True)
@@ -767,6 +802,30 @@ async def order_ready(c: CallbackQuery, bot: Bot):
     await c.message.edit_text(c.message.html_text + "\n\n✔️ <b>Видано</b>")
     await safe_send(bot, o["uid"], f"☕ Замовлення №{n} готове! Забирайте на точці «{esc(o['point'])}».")
     await c.answer("Клієнту надіслано")
+
+
+@router.callback_query(F.data.startswith("nf:"))
+async def order_noshow(c: CallbackQuery, bot: Bot):
+    if not can_staff(c.from_user.id):
+        await c.answer("Недоступно", show_alert=True)
+        return
+    n = c.data.split(":")[1]
+    o = st.d["orders"].get(n)
+    if not o or o["done"]:
+        await c.answer("Замовлення вже закрите")
+        return
+    o["done"], o["noshow"] = True, True
+    u = st.user(o["uid"])
+    if u is not None:
+        u.setdefault("noshows", []).append(time.time())
+    st.log_action("noshow", c.from_user.id, o["uid"], o["point"])
+    st.save()
+    await c.message.edit_text(c.message.html_text + "\n\n🚫 <b>Не забрали</b>")
+    if u is not None:
+        left = st.cfg("noshow_limit") - st.noshow_count(u)
+        tail = (f" Ще {left} таких випадки — і передзамовлення буде вимкнено." if 0 < left <= 1 else "")
+        await safe_send(bot, o["uid"], f"Замовлення №{n} закрито: ви не забрали його вчасно.{tail}")
+    await c.answer("Позначено")
 
 
 # --- запросити друга ---
@@ -1074,6 +1133,7 @@ async def apply_stamp(bot: Bot, me, k, u, by=None):
     st.log_action("stamp", by, k, point, f"від {min_check()}" if st.cfg("stamp_confirm") else "")
     ref_note = await pay_referral(bot, k, u) if first else ""
     st.save()
+    await check_anomaly(bot, by)
     g_stamps = esc(st.reward_title("stamps", u))
     g_pass = esc(st.reward_title("passport", u))
     if not u.get("demo"):
@@ -1090,6 +1150,27 @@ async def apply_stamp(bot: Bot, me, k, u, by=None):
             + (f"\n🎉 Подарунок за штампи: {g_stamps}" if gift else "")
             + (f"\n🧭 Паспорт пройдено — подарунок: {g_pass}" if passed else "")
             + ref_note)
+
+
+async def check_anomaly(bot: Bot, by):
+    """Сповіщення власнику, якщо бариста ставить забагато штампів за годину або видає забагато подарунків за добу."""
+    if not by:
+        return
+    now = time.time()
+    mine = [e for e in st.d["actlog"] if e["by"] == str(by)]
+    checks = [("stamps", st.cfg("alert_stamps_hour"), sum(1 for e in mine if e["kind"] == "stamp" and e["ts"] > now - 3600),
+               "штампів за годину"),
+              ("gifts", st.cfg("alert_gifts_day"), sum(1 for e in mine if e["kind"] == "redeem" and e["ts"] > now - 86400),
+               "подарунків за добу")]
+    sent = st.d.setdefault("alerted", {})
+    for key, lim, n, label in checks:
+        if lim and n >= lim and now - sent.get(f"{by}:{key}", 0) > 3600:
+            sent[f"{by}:{key}"] = now
+            name = (st.user(by) or {}).get("name", by)
+            for o in owners():
+                if str(o) != str(by):
+                    await safe_send(bot, o, f"⚠️ <b>Незвична активність</b>: {esc(name)} — {n} {label} (поріг {lim}). "
+                                            f"Деталі: «⋯ Більше → 👥 Персонал».")
 
 
 async def pay_referral(bot: Bot, k, u):
@@ -1118,6 +1199,7 @@ async def apply_redeem(bot: Bot, k, u, goal=None, by=None, point=None):
         return f"У {esc(u['name'])} немає такого подарунка."
     st.log_action("redeem", by, k, point, g["goal"])
     st.save()
+    await check_anomaly(bot, by)
     title = esc(st.reward_title(g["goal"], u))
     if not u.get("demo"):
         await safe_send(bot, int(k), f"🎁 Видано: <b>{title}</b>. Смачного! ☕")
@@ -1302,7 +1384,7 @@ async def open_orders(m: Message, state: FSMContext):
     for n, o in items[-10:]:
         cu = st.user(o["uid"]) or {}
         note = f"\n📝 {esc(cu['prefs'])}" if cu.get("prefs") else ""
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Готово", callback_data=f"rd:{n}")]])
+        kb = order_kb(n)
         det = f"\n➕ {esc(o['details'])}" if o.get("details") else ""
         await m.answer(f"🧾 <b>№{n}</b> · {esc(o['drink'])} · {o['price']} грн{det}\n📍 {esc(o['point'])} · через {o['min']} хв · "
                        f"{esc(cu.get('name', ''))}{note}", reply_markup=kb)
@@ -1381,6 +1463,8 @@ def control_text():
     for e in st.d["actlog"]:
         if e["ts"] < lim or e["by"] in ("", "None"):
             continue
+        if e["kind"] not in ("stamp", "redeem", "blocked"):
+            continue
         r = rows.setdefault(e["by"], {"stamp": 0, "redeem": 0, "blocked": 0, "days": {}})
         r[e["kind"]] += 1
         if e["kind"] == "stamp":
@@ -1395,8 +1479,9 @@ def control_text():
         flags = (f" · ⚠️ заблоковано спроб: {r['blocked']}" if r["blocked"] else "") + \
                 (f" · клієнтів із 2+ штампами за день: {multi}" if multi else "")
         out.append(f"• {esc(u.get('name', by))}: штампів {r['stamp']}, подарунків видано {r['redeem']}{flags}")
+    ns = sum(1 for e in st.d["actlog"] if e["kind"] == "noshow" and e["ts"] > lim)
     gifts = sum(r["redeem"] for r in rows.values())
-    out.append(f"Подарунків видано всього: {gifts}")
+    out.append(f"Подарунків видано всього: {gifts}" + (f" · не забрали замовлень: {ns}" if ns else ""))
     return "\n".join(out)
 
 
@@ -1449,6 +1534,8 @@ SETTING_ITEMS = [
     ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
     ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("promo_photo", "🖼 Картинка до акцій"),
+    ("order_max_active", "🛒 Активних замовлень на клієнта"), ("noshow_limit", "🚫 «Не забрали» до блокування"),
+    ("alert_stamps_hour", "⚠️ Сповіщення: штампів/год"), ("alert_gifts_day", "⚠️ Сповіщення: подарунків/добу"),
     ("stamp_confirm", "🧾 Штамп за покупку (від ціни найдешевшої кави)"), ("stamp_cooldown", "⏱ Пауза між штампами (хв)"), ("stamp_daily_max", "🔒 Штампів на день"),
     ("ref_on", "👥 Запрошення друзів"), ("ref_max", "👥 Ліміт винагород за друзів"),
     ("birthday_on", "🎂 Подарунок на ДН"), ("birthday_min_days", "🎂 Днів у боті до подарунка"), ("welcome_on", "🎁 Вітальний подарунок"),
@@ -1456,7 +1543,7 @@ SETTING_ITEMS = [
 TOGGLES = {"weekly_on", "welcome_on", "promo_photo", "ref_on", "birthday_on", "stamp_confirm"}
 PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
 NUM_RANGES = {"stamps_goal": (2, 30), "passport_days": (1, 60), "stamp_cooldown": (0, 240),
-              "stamp_daily_max": (0, 20), "ref_max": (0, 50), "birthday_min_days": (0, 365)}
+              "stamp_daily_max": (0, 20), "order_max_active": (1, 5), "noshow_limit": (0, 20), "alert_stamps_hour": (0, 100), "alert_gifts_day": (0, 100), "ref_max": (0, 50), "birthday_min_days": (0, 365)}
 
 
 class Setting(StatesGroup):
@@ -1484,7 +1571,7 @@ SETTING_GROUPS = [
     ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
     ("shop", "🏷 Заклад", ["shop", "points", "maps"]),
-    ("safe", "🛡 Захист і бонуси", ["stamp_confirm", "stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "birthday_on", "birthday_min_days"]),
+    ("safe", "🛡 Захист і бонуси", ["order_max_active", "noshow_limit", "alert_stamps_hour", "alert_gifts_day", "stamp_confirm", "stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "birthday_on", "birthday_min_days"]),
     ("mkt", "📣 Маркетинг", ["promos", "quiet", "promo_time", "weekly_on", "promo_photo"]),
 ]
 
@@ -1529,6 +1616,10 @@ SETTING_HELP = {
     "desserts": "Десерти й ціни, кожен з нового рядка: «Назва - ціна». Приклад:\nКруасан - 55\nЧізкейк - 85\n"
                 "Щоб прибрати десерти з замовлення — надішліть «-».",
     "stamp_cooldown": "Скільки хвилин має минути між двома штампами одному клієнту. 0 — без паузи. Власника це не стосується.",
+    "order_max_active": "Скільки незабраних замовлень може мати клієнт одночасно (1–5).",
+    "noshow_limit": "Після скількох «не забрали» за 30 днів передзамовлення клієнту вимикається. 0 — не обмежувати.",
+    "alert_stamps_hour": "Бот напише власнику, якщо один бариста поставив стільки штампів за годину. 0 — вимкнено.",
+    "alert_gifts_day": "Бот напише власнику, якщо один бариста видав стільки подарунків за добу. 0 — вимкнено.",
     "stamp_daily_max": "Максимум штампів на день одному клієнту. 0 — без ліміту.",
     "ref_max": "Скільки подарунків за запрошених друзів може отримати один клієнт (0 — не нараховувати запрошувачу). Друг свій подарунок отримує завжди.",
     "birthday_min_days": "Скільки днів клієнт має бути в боті, щоб отримати подарунок на день народження (захист від «вказав дату сьогодні». 0 — без обмеження).",
@@ -1758,6 +1849,8 @@ async def scheduler(bot: Bot):
                 st.save()
                 for x in due:
                     log.info("scheduled promo: sent=%s", await broadcast(bot, x["text"]))
+            if st.expire_orders():
+                st.save()
             n = datetime.now(TZ)
             key = n.strftime("%Y-%m-%d")
             if st.cfg("birthday_on") and n.hour >= 9 and st.d.get("bday_sent") != key:
