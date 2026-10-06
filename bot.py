@@ -1099,8 +1099,13 @@ def avail_cat_kb(cat, point):
     rows = []
     for i, (n, p) in enumerate(st.cfg(cat)):
         mark = "✅" if st.is_on(cat, n, point) else "❌"
-        rows.append([InlineKeyboardButton(text=f"{mark} {n}{extra(p) if cat != 'desserts' and cat != 'drinks' else ' · ' + str(p) + ' грн'}"[:60],
-                                          callback_data=f"av:t:{cat}:{i}")])
+        price = extra(p) if cat in ("milks", "syrups") else f" · {p} грн"
+        others = [x for x in st.d["off"].get(f"{cat}:{n}", []) if x != point and x in points()]
+        tail = f" · немає: {', '.join(others)}" if others else ""
+        label = f"{mark} {n}{price}{tail}"
+        if len(label) > 60:
+            label = label[:59] + "…"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"av:t:{cat}:{i}")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="av:m")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
