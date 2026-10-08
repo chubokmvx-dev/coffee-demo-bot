@@ -502,7 +502,7 @@ KIND_LABEL = {"coffee": "☕ Кава", "lemonade": "🍋 Лимонад", "cock
 
 
 def new_cart(pt):
-    return {"pt": pt, "sz": 0, "dr": None, "ml": None, "sy": [], "ds": [], "kinds": [], "lm": None, "ice": None, "ck": None, "ckc": None}
+    return {"pt": pt, "sz": 0, "szu": False, "dr": None, "ml": None, "sy": [], "ds": [], "kinds": [], "lm": None, "ice": None, "ck": None, "ckc": None}
 
 
 def kinds_available(pt):
@@ -556,7 +556,24 @@ def is_sized(name):
 
 
 def size_tag(cart):
-    return f" {sizes()[cart['sz']]}" if cart.get("dr") and is_sized(cart["dr"]) and 0 <= cart.get("sz", 0) < len(sizes()) else ""
+    """Розмір показуємо лише коли його обрано (кава з молоком); чорна кава розміру не має."""
+    return f" {sizes()[cart['sz']]}" if cart.get("dr") and cart.get("szu") and 0 <= cart.get("sz", 0) < len(sizes()) else ""
+
+
+def milk_is_sized(milk, drink):
+    p = st.cfg("milk_over").get(f"{milk}|{drink}")
+    if p is None:
+        p = next((pp for n, pp in st.cfg("milks") if n == milk), None)
+    return isinstance(p, (list, tuple)) and len(p) > 1
+
+
+def milk_label(n, cart):
+    """Доплата в кнопці молока: точна, якщо розмір уже обрано; інакше діапазон по розмірах."""
+    dr = cart.get("dr")
+    if cart.get("szu") or not milk_is_sized(n, dr):
+        return extra(milk_price(n, dr, cart.get("sz", 0)))
+    vals = [milk_price(n, dr, k) for k in range(len(sizes()))]
+    return f" +{min(vals)}–{max(vals)} грн (за розміром)"
 
 
 def milk_price(milk, drink, si=0):
@@ -631,6 +648,8 @@ def step_has_options(cart, step):
         return "coffee" in kinds
     if step == "size":
         return bool(cart.get("dr")) and is_sized(cart["dr"])
+    if step == "msize":
+        return bool(cart.get("ml")) and not cart.get("szu") and milk_is_sized(cart["ml"], cart.get("dr"))
     if step in ("milk", "syrup"):
         return "coffee" in kinds and bool(avail("milks" if step == "milk" else "syrups", cart["pt"]))
     if step in ("lemon", "ice"):
@@ -644,7 +663,7 @@ def step_has_options(cart, step):
     return True
 
 
-STEP_ORDER = ["kind", "drink", "size", "milk", "syrup", "lemon", "ice", "cocktail", "age", "dessert", "time", "confirm"]
+STEP_ORDER = ["kind", "drink", "size", "milk", "msize", "syrup", "lemon", "ice", "cocktail", "age", "dessert", "time", "confirm"]
 
 
 def next_step(cart, cur):
@@ -695,10 +714,15 @@ async def render_step(msg: Message, cart: dict, step: str, edit=True):
         text = head + "📏 <b>Який розмір?</b>"
         ps = next(p for n, p in st.cfg("drinks") if n == cart["dr"])
         rows = [[InlineKeyboardButton(text=f"{sz} — {pval(ps, k)} грн", callback_data=f"o:sz:{k}")] for k, sz in enumerate(sizes()[:len(ps)])]
+    elif step == "msize":
+        text = head + "📏 <b>Який розмір?</b>"
+        base = price_of("drinks", cart["dr"], 0) or 0
+        rows = [[InlineKeyboardButton(text=f"{sz} — {base + milk_price(cart['ml'], cart['dr'], k)} грн", callback_data=f"o:sz:{k}")]
+                for k, sz in enumerate(sizes())]
     elif step == "milk":
         text = head + "🥛 <b>Яке молоко?</b>"
         rows = [[InlineKeyboardButton(text="Звичайне (без доплати)", callback_data="o:ml:x")]]
-        rows += [[InlineKeyboardButton(text=f"{n}{extra(milk_price(n, cart['dr'], cart.get('sz', 0)))}", callback_data=f"o:ml:{i}")] for i, n, p in avail("milks", pt)]
+        rows += [[InlineKeyboardButton(text=f"{n}{milk_label(n, cart)}"[:60], callback_data=f"o:ml:{i}")] for i, n, p in avail("milks", pt)]
     elif step == "syrup":
         text = head + "🍯 <b>Додати сироп?</b> Можна кілька або пропустити."
         rows = [[InlineKeyboardButton(text=f"{'✅' if n in cart['sy'] else '⬜'} {n}{extra(p)}", callback_data=f"o:sy:{i}")]
@@ -785,11 +809,11 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
             if not item:
                 await c.answer("Цього напою зараз немає.", show_alert=True)
                 return
-            cart["dr"], cart["sz"] = item, 0
+            cart["dr"], cart["sz"], cart["szu"] = item, 0, False
             step = next_step(cart, "drink")
         elif act == "sz":
-            cart["sz"] = int(arg)
-            step = next_step(cart, "size")
+            cart["sz"], cart["szu"] = int(arg), True
+            step = next_step(cart, "msize" if cart.get("ml") and not is_sized(cart["dr"]) else "size")
         elif act == "kd":
             ks = kinds_available(pt)
             if arg == "ok":
@@ -831,6 +855,8 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
                 step = "cocktail"
         elif act == "ml":
             cart["ml"] = None if arg == "x" else next((n for i, n, p in avail("milks", pt) if i == int(arg)), None)
+            if not is_sized(cart["dr"]):
+                cart["sz"], cart["szu"] = 0, False      # розмір чорної кави залежить лише від обраного молока
             step = next_step(cart, "milk")
         elif act in ("sy", "ds"):
             key, cat, cur = ("sy", "syrups", "syrup") if act == "sy" else ("ds", "desserts", "dessert")
@@ -845,7 +871,7 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
             cart["tm"] = int(arg)
             step = "confirm"
         elif act == "back":
-            cart.update({"dr": None, "sz": 0, "ml": None, "sy": [], "ds": [], "lm": None, "ice": None, "ck": None, "ckc": None})
+            cart.update({"dr": None, "sz": 0, "szu": False, "ml": None, "sy": [], "ds": [], "lm": None, "ice": None, "ck": None, "ckc": None})
             if len(kinds_available(pt)) > 1:
                 cart["kinds"] = []
             step = first_step(cart)
@@ -902,7 +928,7 @@ async def place_order(bot: Bot, user, cart: dict, usual=False):
     details = cart_details(cart)
     n = st.add_order(user.id, order_title(cart), total, cart["tm"], cart["pt"], details)
     if cart.get("dr"):      # «як завжди» поки що запам'ятовує лише каву
-        u["last"] = {"d": cart["dr"], "p": cart["pt"], "m": cart.get("ml"), "s": list(cart.get("sy", [])), "z": cart.get("sz", 0)}
+        u["last"] = {"d": cart["dr"], "p": cart["pt"], "m": cart.get("ml"), "s": list(cart.get("sy", [])), "z": cart.get("sz", 0), "zu": bool(cart.get("szu"))}
     st.save()
     touch(user.id)
     kb = order_kb(n)
@@ -927,7 +953,7 @@ def usual_cart(u):
         return None
     if "d" in last:
         c = new_cart(last["p"])
-        c.update({"dr": last["d"], "sz": last.get("z", 0), "ml": last.get("m"), "sy": list(last.get("s", [])), "kinds": ["coffee"]})
+        c.update({"dr": last["d"], "sz": last.get("z", 0), "szu": bool(last.get("zu", last.get("z", 0))), "ml": last.get("m"), "sy": list(last.get("s", [])), "kinds": ["coffee"]})
         return c
     ds = drinks()
     if isinstance(last.get("drink"), int) and last["drink"] < len(ds):
