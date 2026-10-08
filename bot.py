@@ -496,7 +496,34 @@ async def menu_cb(c: CallbackQuery, state: FSMContext):
 
 
 # --- конструктор замовлення: точка → напій → молоко → сироп → десерт → час ---
-CATS = {"milks": "🥛 Молоко", "syrups": "🍯 Сиропи", "desserts": "🍰 Десерти", "drinks": "☕ Напої"}
+CATS = {"milks": "🥛 Молоко", "syrups": "🍯 Сиропи", "desserts": "🍰 Десерти", "drinks": "☕ Напої",
+        "lemonades": "🍋 Лимонади", "cocktails": "🍸 Коктейлі (алко)", "mocktails": "🍹 Коктейлі (без алко)"}
+KIND_LABEL = {"coffee": "☕ Кава", "lemonade": "🍋 Лимонад", "cocktail": "🍸 Коктейль"}
+
+
+def new_cart(pt):
+    return {"pt": pt, "dr": None, "ml": None, "sy": [], "ds": [], "kinds": [], "lm": None, "ice": None, "ck": None, "ckc": None}
+
+
+def kinds_available(pt):
+    """Які розділи є на точці (кава, лимонад, коктейль)."""
+    out = []
+    if avail("drinks", pt):
+        out.append("coffee")
+    if avail("lemonades", pt):
+        out.append("lemonade")
+    if avail("cocktails", pt) or avail("mocktails", pt):
+        out.append("cocktail")
+    return out
+
+
+def has_item(cart):
+    return bool(cart.get("dr") or cart.get("lm") or cart.get("ck"))
+
+
+def order_title(cart):
+    parts = [x for x in (cart.get("dr"), cart.get("lm"), cart.get("ck")) if x]
+    return " + ".join(parts)
 
 
 def price_of(cat, name):
@@ -516,7 +543,11 @@ def extra(p):
 
 
 def cart_total(cart):
-    total = price_of("drinks", cart["dr"]) or 0
+    total = (price_of("drinks", cart["dr"]) or 0) if cart.get("dr") else 0
+    if cart.get("lm"):
+        total += price_of("lemonades", cart["lm"]) or 0
+    if cart.get("ck"):
+        total += price_of(cart["ckc"], cart["ck"]) or 0
     if cart.get("ml"):
         total += price_of("milks", cart["ml"]) or 0
     total += sum(price_of("syrups", x) or 0 for x in cart.get("sy", []))
@@ -525,7 +556,14 @@ def cart_total(cart):
 
 
 def cart_lines(cart):
-    out = [f"☕ <b>{esc(cart['dr'])}</b> · {price_of('drinks', cart['dr'])} грн"]
+    out = []
+    if cart.get("dr"):
+        out.append(f"☕ <b>{esc(cart['dr'])}</b> · {price_of('drinks', cart['dr'])} грн")
+    if cart.get("lm"):
+        out.append(f"🍋 <b>{esc(cart['lm'])}</b> ({esc(cart.get('ice') or 'з льодом')}) · {price_of('lemonades', cart['lm'])} грн")
+    if cart.get("ck"):
+        out.append(f"{'🍸' if cart['ckc'] == 'cocktails' else '🍹'} <b>{esc(cart['ck'])}</b> · {price_of(cart['ckc'], cart['ck'])} грн"
+                   + (" · 🔞 алкоголь" if cart["ckc"] == "cocktails" else ""))
     if cart.get("ml"):
         out.append(f"🥛 {esc(cart['ml'])}{extra(price_of('milks', cart['ml']))}")
     for x in cart.get("sy", []):
@@ -538,6 +576,10 @@ def cart_lines(cart):
 def cart_details(cart):
     """Коротко для бариста: усе, крім самого напою."""
     parts = []
+    if cart.get("lm"):
+        parts.append(f"лимонад: {cart['lm']}, {cart.get('ice') or 'з льодом'}")
+    if cart.get("ck"):
+        parts.append(f"коктейль: {cart['ck']}")
     if cart.get("ml"):
         parts.append(f"молоко: {cart['ml']}")
     if cart.get("sy"):
@@ -548,18 +590,29 @@ def cart_details(cart):
 
 
 def step_has_options(cart, step):
-    if step == "milk":
-        return bool(avail("milks", cart["pt"]))
-    if step == "syrup":
-        return bool(avail("syrups", cart["pt"]))
+    kinds = cart.get("kinds") or ["coffee"]
+    if step == "drink":
+        return "coffee" in kinds
+    if step in ("milk", "syrup"):
+        return "coffee" in kinds and bool(avail("milks" if step == "milk" else "syrups", cart["pt"]))
+    if step in ("lemon", "ice"):
+        return "lemonade" in kinds
+    if step == "cocktail":
+        return "cocktail" in kinds
+    if step == "age":
+        return cart.get("ckc") == "cocktails" and not cart.get("age_ok")
     if step == "dessert":
         return bool(avail("desserts", cart["pt"]))
     return True
 
 
+STEP_ORDER = ["kind", "drink", "milk", "syrup", "lemon", "ice", "cocktail", "age", "dessert", "time", "confirm"]
+
+
 def next_step(cart, cur):
-    order = ["drink", "milk", "syrup", "dessert", "time", "confirm"]
-    for st_ in order[order.index(cur) + 1:]:
+    for st_ in STEP_ORDER[STEP_ORDER.index(cur) + 1:]:
+        if st_ == "kind":
+            continue
         if step_has_options(cart, st_):
             return st_
     return "confirm"
@@ -572,10 +625,30 @@ def kb_rows(rows):
 async def render_step(msg: Message, cart: dict, step: str, edit=True):
     pt = cart["pt"]
     head = f"📍 {esc(pt)}\n"
-    if cart.get("dr"):
+    if has_item(cart):
         head += "\n".join(cart_lines(cart)) + "\n"
     head += "\n"
-    if step == "drink":
+    if step == "kind":
+        ks = kinds_available(pt)
+        text = f"📍 {esc(pt)}\n\n<b>Що бажаєте?</b> Можна обрати кілька."
+        rows = [[InlineKeyboardButton(text=f"{'✅' if k in cart['kinds'] else '⬜'} {KIND_LABEL[k]}", callback_data=f"o:kd:{k}")] for k in ks]
+        rows.append([InlineKeyboardButton(text="Далі ➡️", callback_data="o:kd:ok")])
+    elif step == "lemon":
+        text = head + "🍋 <b>Який лимонад?</b>"
+        rows = [[InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"o:lm:{i}")] for i, n, p in avail("lemonades", pt)]
+    elif step == "ice":
+        text = head + "🧊 <b>Лимонад з льодом?</b>"
+        rows = [[InlineKeyboardButton(text="🧊 З льодом", callback_data="o:ic:1"),
+                 InlineKeyboardButton(text="Без льоду", callback_data="o:ic:0")]]
+    elif step == "cocktail":
+        text = head + "🍸 <b>Який коктейль?</b>  🔞 — з алкоголем"
+        rows = [[InlineKeyboardButton(text=f"🔞 {n} — {p} грн", callback_data=f"o:ck:a:{i}")] for i, n, p in avail("cocktails", pt)]
+        rows += [[InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"o:ck:n:{i}")] for i, n, p in avail("mocktails", pt)]
+    elif step == "age":
+        text = head + "🔞 <b>Алкоголь лише для повнолітніх.</b>\nПідтвердіть, що вам виконалось 18 років. На точці можуть попросити документ."
+        rows = [[InlineKeyboardButton(text="✅ Мені є 18", callback_data="o:ag:1")],
+                [InlineKeyboardButton(text="Замінити на безалкогольний", callback_data="o:ag:0")]]
+    elif step == "drink":
         items = avail("drinks", pt)
         text = f"📍 {esc(pt)}\n\n☕ <b>Що замовити?</b>" if items else f"📍 {esc(pt)}\n\nНа цій точці зараз немає напоїв."
         rows = [[InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"o:dr:{i}")] for i, n, p in items]
@@ -606,6 +679,22 @@ async def render_step(msg: Message, cart: dict, step: str, edit=True):
         await msg.answer(text, reply_markup=kb_rows(rows))
 
 
+def begin_cart(pt, uid):
+    cart = new_cart(pt)
+    ks = kinds_available(pt)
+    cart["kinds"] = ks if len(ks) <= 1 else []     # якщо розділ один — обираємо за клієнта
+    cart["age_ok"] = bool((st.user(uid) or {}).get("age_ok"))
+    return cart
+
+
+def first_step(cart):
+    if len(kinds_available(cart["pt"])) > 1:
+        return "kind"
+    if not cart["kinds"]:
+        return "drink"
+    return next_step(cart, "kind")
+
+
 async def start_order(msg: Message, user, state: FSMContext):
     """Крок 0: точка (якщо точок кілька). Запам'ятовує останню точку першою."""
     u, _ = st.ensure(user.id, user.full_name)
@@ -617,9 +706,9 @@ async def start_order(msg: Message, user, state: FSMContext):
     last_pt = (u.get("last") or {}).get("p")
     order = sorted(ps, key=lambda p: p != last_pt)
     if len(ps) == 1:
-        cart = {"pt": ps[0], "dr": None, "ml": None, "sy": [], "ds": []}
+        cart = begin_cart(ps[0], user.id)
         await state.update_data(cart=cart)
-        await render_step(msg, cart, "drink", edit=False)
+        await render_step(msg, cart, first_step(cart), edit=False)
         return
     rows = [[InlineKeyboardButton(text=f"📍 {p}", callback_data=f"o:pt:{ps.index(p)}")] for p in order]
     await msg.answer("Де заберете замовлення?", reply_markup=kb_rows(rows))
@@ -638,9 +727,9 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
     arg = parts[2] if len(parts) > 2 else None
     cart = (await state.get_data()).get("cart")
     if act == "pt":
-        cart = {"pt": point_at(int(arg)), "dr": None, "ml": None, "sy": [], "ds": []}
+        cart = begin_cart(point_at(int(arg)), c.from_user.id)
         await state.update_data(cart=cart)
-        await render_step(c.message, cart, "drink")
+        await render_step(c.message, cart, first_step(cart))
         await c.answer()
         return
     if not cart:
@@ -655,6 +744,45 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
                 return
             cart["dr"] = item
             step = next_step(cart, "drink")
+        elif act == "kd":
+            ks = kinds_available(pt)
+            if arg == "ok":
+                if not cart["kinds"]:
+                    await c.answer("Оберіть хоча б один розділ.", show_alert=True)
+                    return
+                step = next_step(cart, "kind")
+            else:
+                if arg in ks:
+                    cart["kinds"] = [x for x in cart["kinds"] if x != arg] if arg in cart["kinds"] else cart["kinds"] + [arg]
+                step = "kind"
+        elif act == "lm":
+            item = next((n for i, n, p in avail("lemonades", pt) if i == int(arg)), None)
+            if not item:
+                await c.answer("Цього лимонаду зараз немає.", show_alert=True)
+                return
+            cart["lm"] = item
+            step = next_step(cart, "lemon")
+        elif act == "ic":
+            cart["ice"] = "з льодом" if arg == "1" else "без льоду"
+            step = next_step(cart, "ice")
+        elif act == "ck":
+            cat = "cocktails" if arg == "a" else "mocktails"
+            item = next((n for i, n, p in avail(cat, pt) if i == int(parts[3])), None)
+            if not item:
+                await c.answer("Цього коктейлю зараз немає.", show_alert=True)
+                return
+            cart["ck"], cart["ckc"] = item, cat
+            step = next_step(cart, "cocktail")
+        elif act == "ag":
+            if arg == "1":
+                cart["age_ok"] = True
+                u, _ = st.ensure(c.from_user.id, c.from_user.full_name)
+                u["age_ok"] = True       # самодекларація; після підключення Poster перевірятиметься за датою народження
+                st.save()
+                step = next_step(cart, "age")
+            else:
+                cart["ck"] = cart["ckc"] = None
+                step = "cocktail"
         elif act == "ml":
             cart["ml"] = None if arg == "x" else next((n for i, n, p in avail("milks", pt) if i == int(arg)), None)
             step = next_step(cart, "milk")
@@ -671,11 +799,16 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
             cart["tm"] = int(arg)
             step = "confirm"
         elif act == "back":
-            cart.update({"dr": None, "ml": None, "sy": [], "ds": []})
-            step = "drink"
+            cart.update({"dr": None, "ml": None, "sy": [], "ds": [], "lm": None, "ice": None, "ck": None, "ckc": None})
+            if len(kinds_available(pt)) > 1:
+                cart["kinds"] = []
+            step = first_step(cart)
         elif act == "go":
-            if not cart.get("dr") or not cart.get("tm"):
+            if not has_item(cart) or not cart.get("tm"):
                 await c.answer("Замовлення неповне.", show_alert=True)
+                return
+            if cart.get("ckc") == "cocktails" and not cart.get("age_ok"):
+                await c.answer("Потрібне підтвердження 18+.", show_alert=True)
                 return
             why = order_block(c.from_user.id)
             if why:
@@ -721,8 +854,9 @@ async def place_order(bot: Bot, user, cart: dict, usual=False):
     u, _ = st.ensure(user.id, user.full_name)
     total = cart_total(cart)
     details = cart_details(cart)
-    n = st.add_order(user.id, cart["dr"], total, cart["tm"], cart["pt"], details)
-    u["last"] = {"d": cart["dr"], "p": cart["pt"], "m": cart.get("ml"), "s": list(cart.get("sy", []))}
+    n = st.add_order(user.id, order_title(cart), total, cart["tm"], cart["pt"], details)
+    if cart.get("dr"):      # «як завжди» поки що запам'ятовує лише каву
+        u["last"] = {"d": cart["dr"], "p": cart["pt"], "m": cart.get("ml"), "s": list(cart.get("sy", []))}
     st.save()
     touch(user.id)
     kb = order_kb(n)
@@ -730,6 +864,8 @@ async def place_order(bot: Bot, user, cart: dict, usual=False):
     if u.get("prefs"):
         note += f"\n📝 Вподобання: <b>{esc(u['prefs'])}</b>"
     body = "\n".join(cart_lines(cart))
+    if cart.get("ckc") == "cocktails":
+        note += "\n🔞 Є алкоголь: клієнт підтвердив 18+, перевірте документ при видачі"
     for o in order_recipients(cart["pt"]):
         await safe_send(bot, o, f"🆕 <b>Замовлення №{n}</b> · {total} грн\n{body}\n📍 {esc(cart['pt'])} · через {cart['tm']} хв\n"
                                 f"Клієнт: {esc(user.full_name)}{note}", reply_markup=kb)
@@ -744,10 +880,14 @@ def usual_cart(u):
     if not last:
         return None
     if "d" in last:
-        return {"pt": last["p"], "dr": last["d"], "ml": last.get("m"), "sy": list(last.get("s", [])), "ds": []}
+        c = new_cart(last["p"])
+        c.update({"dr": last["d"], "ml": last.get("m"), "sy": list(last.get("s", [])), "kinds": ["coffee"]})
+        return c
     ds = drinks()
     if isinstance(last.get("drink"), int) and last["drink"] < len(ds):
-        return {"pt": point_at(last.get("point", 0)), "dr": ds[last["drink"]][0], "ml": None, "sy": [], "ds": []}
+        c = new_cart(point_at(last.get("point", 0)))
+        c.update({"dr": ds[last["drink"]][0], "kinds": ["coffee"]})
+        return c
     return None
 
 
@@ -1172,7 +1312,8 @@ async def change_point(m: Message, state: FSMContext):
 
 def min_check():
     """Мінімальна сума чека для штампа = ціна найдешевшого напою з меню (власнику нічого налаштовувати не треба)."""
-    return min((p for _, p in drinks()), default=0)
+    prices = [p for cat in ("drinks", "lemonades", "mocktails") for _, p in st.cfg(cat)]
+    return min(prices, default=0)
 
 
 def stamp_confirm_kb(tok):
@@ -1621,6 +1762,7 @@ SETTING_ITEMS = [
     ("shop", "🏷 Назва закладу"), ("stamps_goal", "☕ Штампів до подарунка"),
     ("passport_days", "🧭 Паспорт: днів"), ("points", "📍 Точки"), ("drinks", "🍵 Напої та ціни"),
     ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
+    ("lemonades", "🍋 Лимонади"), ("cocktails", "🍸 Коктейлі (алкоголь)"), ("mocktails", "🍹 Коктейлі (без алкоголю)"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
     ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("promo_photo", "🖼 Картинка до акцій"),
     ("order_max_active", "🛒 Активних замовлень на клієнта"), ("noshow_limit", "🚫 «Не забрали» до блокування"),
@@ -1631,7 +1773,7 @@ SETTING_ITEMS = [
     ("backup_on", "💾 Щоденний бекап"), ("birthday_on", "🎂 Подарунок на ДН"), ("birthday_min_days", "🎂 Днів у боті до подарунка"), ("welcome_on", "🎁 Вітальний подарунок"),
 ]
 TOGGLES = {"weekly_on", "welcome_on", "promo_photo", "ref_on", "birthday_on", "stamp_confirm", "backup_on"}
-PRICE_KEYS = ("drinks", "milks", "syrups", "desserts")
+PRICE_KEYS = ("drinks", "milks", "syrups", "desserts", "lemonades", "cocktails", "mocktails")
 NUM_RANGES = {"stamps_goal": (2, 30), "passport_days": (1, 60), "stamp_cooldown": (0, 240),
               "stamp_daily_max": (0, 20), "order_max_active": (1, 5), "noshow_limit": (0, 20), "alert_stamps_hour": (0, 100), "alert_gifts_day": (0, 100), "ref_max": (0, 50), "birthday_min_days": (0, 365),
               "gift_valid_days": (0, 365), "promo_valid_days": (1, 60)}
@@ -1659,7 +1801,7 @@ def setting_value(key):
 
 
 SETTING_GROUPS = [
-    ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts"]),
+    ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts", "lemonades", "cocktails", "mocktails"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
     ("shop", "🏷 Заклад", ["shop", "points", "maps"]),
     ("safe", "🛡 Захист і бонуси", ["order_max_active", "noshow_limit", "alert_stamps_hour", "alert_gifts_day", "stamp_confirm", "stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "gift_valid_days", "promo_valid_days", "backup_on", "birthday_on", "birthday_min_days"]),
@@ -1706,6 +1848,11 @@ SETTING_HELP = {
               "Щоб прибрати крок сиропів — надішліть «-».",
     "desserts": "Десерти й ціни, кожен з нового рядка: «Назва - ціна». Приклад:\nКруасан - 55\nЧізкейк - 85\n"
                 "Щоб прибрати десерти з замовлення — надішліть «-».",
+    "lemonades": "Лимонади (смаки) і ціни, кожен з нового рядка: «Назва - ціна». Приклад:\nЛимон-м'ята - 65\nМаракуя - 70\n"
+                 "Лід клієнт обирає окремим кроком. Щоб прибрати розділ — надішліть «-».",
+    "cocktails": "Алкогольні коктейлі й ціни, кожен з нового рядка: «Назва - ціна». Перед замовленням бот попросить підтвердити 18+. "
+                 "Щоб прибрати — надішліть «-».",
+    "mocktails": "Безалкогольні коктейлі й ціни, кожен з нового рядка: «Назва - ціна». Щоб прибрати — надішліть «-».",
     "stamp_cooldown": "Скільки хвилин має минути між двома штампами одному клієнту. 0 — без паузи. Власника це не стосується.",
     "order_max_active": "Скільки незабраних замовлень може мати клієнт одночасно (1–5).",
     "noshow_limit": "Після скількох «не забрали» за 30 днів передзамовлення клієнту вимикається. 0 — не обмежувати.",
