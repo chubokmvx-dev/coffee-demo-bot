@@ -502,7 +502,7 @@ KIND_LABEL = {"coffee": "☕ Кава", "lemonade": "🍋 Лимонад", "cock
 
 
 def new_cart(pt):
-    return {"pt": pt, "dr": None, "ml": None, "sy": [], "ds": [], "kinds": [], "lm": None, "ice": None, "ck": None, "ckc": None}
+    return {"pt": pt, "sz": 0, "dr": None, "ml": None, "sy": [], "ds": [], "kinds": [], "lm": None, "ice": None, "ck": None, "ckc": None}
 
 
 def kinds_available(pt):
@@ -522,15 +522,49 @@ def has_item(cart):
 
 
 def order_title(cart):
-    parts = [x for x in (cart.get("dr"), cart.get("lm"), cart.get("ck")) if x]
+    parts = [x for x in ((cart.get("dr") or "") + size_tag(cart), cart.get("lm"), cart.get("ck")) if x]
     return " + ".join(parts)
 
 
-def price_of(cat, name):
+def pval(p, si=0):
+    """Ціна позиції: число або список по розмірах (S/M/L)."""
+    if isinstance(p, (list, tuple)):
+        return p[si] if 0 <= si < len(p) else p[-1]
+    return p
+
+
+def pmin(p):
+    return min(p) if isinstance(p, (list, tuple)) else p
+
+
+def price_of(cat, name, si=0):
     for n, p in st.cfg(cat):
         if n == name:
-            return p
+            return pval(p, si)
     return None
+
+
+def sizes():
+    return st.cfg("sizes")
+
+
+def is_sized(name):
+    for n, p in st.cfg("drinks"):
+        if n == name:
+            return isinstance(p, (list, tuple)) and len(p) > 1
+    return False
+
+
+def size_tag(cart):
+    return f" {sizes()[cart['sz']]}" if cart.get("dr") and is_sized(cart["dr"]) and 0 <= cart.get("sz", 0) < len(sizes()) else ""
+
+
+def milk_price(milk, drink, si=0):
+    """Доплата за молоко залежить від розміру й (за потреби) від самого напою."""
+    over = st.cfg("milk_over").get(f"{milk}|{drink}")
+    if over is not None:
+        return pval(over, si)
+    return price_of("milks", milk, si) or 0
 
 
 def avail(cat, point):
@@ -543,13 +577,13 @@ def extra(p):
 
 
 def cart_total(cart):
-    total = (price_of("drinks", cart["dr"]) or 0) if cart.get("dr") else 0
+    total = (price_of("drinks", cart["dr"], cart.get("sz", 0)) or 0) if cart.get("dr") else 0
     if cart.get("lm"):
         total += price_of("lemonades", cart["lm"]) or 0
     if cart.get("ck"):
         total += price_of(cart["ckc"], cart["ck"]) or 0
     if cart.get("ml"):
-        total += price_of("milks", cart["ml"]) or 0
+        total += milk_price(cart["ml"], cart.get("dr"), cart.get("sz", 0))
     total += sum(price_of("syrups", x) or 0 for x in cart.get("sy", []))
     total += sum(price_of("desserts", x) or 0 for x in cart.get("ds", []))
     return total
@@ -558,14 +592,14 @@ def cart_total(cart):
 def cart_lines(cart):
     out = []
     if cart.get("dr"):
-        out.append(f"☕ <b>{esc(cart['dr'])}</b> · {price_of('drinks', cart['dr'])} грн")
+        out.append(f"☕ <b>{esc(cart['dr'])}{size_tag(cart)}</b> · {price_of('drinks', cart['dr'], cart.get('sz', 0))} грн")
     if cart.get("lm"):
         out.append(f"🍋 <b>{esc(cart['lm'])}</b> ({esc(cart.get('ice') or 'з льодом')}) · {price_of('lemonades', cart['lm'])} грн")
     if cart.get("ck"):
         out.append(f"{'🍸' if cart['ckc'] == 'cocktails' else '🍹'} <b>{esc(cart['ck'])}</b> · {price_of(cart['ckc'], cart['ck'])} грн"
                    + (" · 🔞 алкоголь" if cart["ckc"] == "cocktails" else ""))
     if cart.get("ml"):
-        out.append(f"🥛 {esc(cart['ml'])}{extra(price_of('milks', cart['ml']))}")
+        out.append(f"🥛 {esc(cart['ml'])}{extra(milk_price(cart['ml'], cart.get('dr'), cart.get('sz', 0)))}")
     for x in cart.get("sy", []):
         out.append(f"🍯 {esc(x)}{extra(price_of('syrups', x))}")
     for x in cart.get("ds", []):
@@ -576,6 +610,8 @@ def cart_lines(cart):
 def cart_details(cart):
     """Коротко для бариста: усе, крім самого напою."""
     parts = []
+    if cart.get("dr") and size_tag(cart):
+        parts.append(f"розмір: {size_tag(cart).strip()}")
     if cart.get("lm"):
         parts.append(f"лимонад: {cart['lm']}, {cart.get('ice') or 'з льодом'}")
     if cart.get("ck"):
@@ -593,6 +629,8 @@ def step_has_options(cart, step):
     kinds = cart.get("kinds") or ["coffee"]
     if step == "drink":
         return "coffee" in kinds
+    if step == "size":
+        return bool(cart.get("dr")) and is_sized(cart["dr"])
     if step in ("milk", "syrup"):
         return "coffee" in kinds and bool(avail("milks" if step == "milk" else "syrups", cart["pt"]))
     if step in ("lemon", "ice"):
@@ -606,7 +644,7 @@ def step_has_options(cart, step):
     return True
 
 
-STEP_ORDER = ["kind", "drink", "milk", "syrup", "lemon", "ice", "cocktail", "age", "dessert", "time", "confirm"]
+STEP_ORDER = ["kind", "drink", "size", "milk", "syrup", "lemon", "ice", "cocktail", "age", "dessert", "time", "confirm"]
 
 
 def next_step(cart, cur):
@@ -651,11 +689,16 @@ async def render_step(msg: Message, cart: dict, step: str, edit=True):
     elif step == "drink":
         items = avail("drinks", pt)
         text = f"📍 {esc(pt)}\n\n☕ <b>Що замовити?</b>" if items else f"📍 {esc(pt)}\n\nНа цій точці зараз немає напоїв."
-        rows = [[InlineKeyboardButton(text=f"{n} — {p} грн", callback_data=f"o:dr:{i}")] for i, n, p in items]
+        rows = [[InlineKeyboardButton(text=(f"{n} — від {pmin(p)} грн" if isinstance(p, (list, tuple)) and len(p) > 1 else f"{n} — {pval(p)} грн"),
+                                      callback_data=f"o:dr:{i}")] for i, n, p in items]
+    elif step == "size":
+        text = head + "📏 <b>Який розмір?</b>"
+        ps = next(p for n, p in st.cfg("drinks") if n == cart["dr"])
+        rows = [[InlineKeyboardButton(text=f"{sz} — {pval(ps, k)} грн", callback_data=f"o:sz:{k}")] for k, sz in enumerate(sizes()[:len(ps)])]
     elif step == "milk":
         text = head + "🥛 <b>Яке молоко?</b>"
         rows = [[InlineKeyboardButton(text="Звичайне (без доплати)", callback_data="o:ml:x")]]
-        rows += [[InlineKeyboardButton(text=f"{n}{extra(p)}", callback_data=f"o:ml:{i}")] for i, n, p in avail("milks", pt)]
+        rows += [[InlineKeyboardButton(text=f"{n}{extra(milk_price(n, cart['dr'], cart.get('sz', 0)))}", callback_data=f"o:ml:{i}")] for i, n, p in avail("milks", pt)]
     elif step == "syrup":
         text = head + "🍯 <b>Додати сироп?</b> Можна кілька або пропустити."
         rows = [[InlineKeyboardButton(text=f"{'✅' if n in cart['sy'] else '⬜'} {n}{extra(p)}", callback_data=f"o:sy:{i}")]
@@ -742,8 +785,11 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
             if not item:
                 await c.answer("Цього напою зараз немає.", show_alert=True)
                 return
-            cart["dr"] = item
+            cart["dr"], cart["sz"] = item, 0
             step = next_step(cart, "drink")
+        elif act == "sz":
+            cart["sz"] = int(arg)
+            step = next_step(cart, "size")
         elif act == "kd":
             ks = kinds_available(pt)
             if arg == "ok":
@@ -799,7 +845,7 @@ async def order_cb(c: CallbackQuery, state: FSMContext, bot: Bot):
             cart["tm"] = int(arg)
             step = "confirm"
         elif act == "back":
-            cart.update({"dr": None, "ml": None, "sy": [], "ds": [], "lm": None, "ice": None, "ck": None, "ckc": None})
+            cart.update({"dr": None, "sz": 0, "ml": None, "sy": [], "ds": [], "lm": None, "ice": None, "ck": None, "ckc": None})
             if len(kinds_available(pt)) > 1:
                 cart["kinds"] = []
             step = first_step(cart)
@@ -856,7 +902,7 @@ async def place_order(bot: Bot, user, cart: dict, usual=False):
     details = cart_details(cart)
     n = st.add_order(user.id, order_title(cart), total, cart["tm"], cart["pt"], details)
     if cart.get("dr"):      # «як завжди» поки що запам'ятовує лише каву
-        u["last"] = {"d": cart["dr"], "p": cart["pt"], "m": cart.get("ml"), "s": list(cart.get("sy", []))}
+        u["last"] = {"d": cart["dr"], "p": cart["pt"], "m": cart.get("ml"), "s": list(cart.get("sy", [])), "z": cart.get("sz", 0)}
     st.save()
     touch(user.id)
     kb = order_kb(n)
@@ -881,7 +927,7 @@ def usual_cart(u):
         return None
     if "d" in last:
         c = new_cart(last["p"])
-        c.update({"dr": last["d"], "ml": last.get("m"), "sy": list(last.get("s", [])), "kinds": ["coffee"]})
+        c.update({"dr": last["d"], "sz": last.get("z", 0), "ml": last.get("m"), "sy": list(last.get("s", [])), "kinds": ["coffee"]})
         return c
     ds = drinks()
     if isinstance(last.get("drink"), int) and last["drink"] < len(ds):
@@ -911,7 +957,7 @@ def usual_label(u):
     c = usual_cart(u)
     if not c:
         return None
-    return c["dr"] + (f" + {c['ml']}" if c["ml"] else "") + (f" + {', '.join(c['sy'])}" if c["sy"] else "")
+    return c["dr"] + size_tag(c) + (f" + {c['ml']}" if c["ml"] else "") + (f" + {', '.join(c['sy'])}" if c["sy"] else "")
 
 
 @router.message(F.text == B_USUAL)
@@ -1312,7 +1358,7 @@ async def change_point(m: Message, state: FSMContext):
 
 def min_check():
     """Мінімальна сума чека для штампа = ціна найдешевшого напою з меню (власнику нічого налаштовувати не треба)."""
-    prices = [p for cat in ("drinks", "lemonades", "mocktails") for _, p in st.cfg(cat)]
+    prices = [pmin(p) for cat in ("drinks", "lemonades", "mocktails") for _, p in st.cfg(cat)]
     return min(prices, default=0)
 
 
@@ -1636,7 +1682,8 @@ def avail_cat_kb(cat, point):
     rows = []
     for i, (n, p) in enumerate(st.cfg(cat)):
         mark = "✅" if st.is_on(cat, n, point) else "❌"
-        price = extra(p) if cat in ("milks", "syrups") else f" · {p} грн"
+        ps = "/".join(map(str, p)) if isinstance(p, (list, tuple)) else p
+        price = extra(ps) if cat in ("syrups",) and not isinstance(p, (list, tuple)) else (f" +{ps}" if cat == "milks" else f" · {ps} грн")
         others = [x for x in st.d["off"].get(f"{cat}:{n}", []) if x != point and x in points()]
         tail = f" · немає: {', '.join(others)}" if others else ""
         label = f"{mark} {n}{price}{tail}"
@@ -1762,6 +1809,7 @@ SETTING_ITEMS = [
     ("shop", "🏷 Назва закладу"), ("stamps_goal", "☕ Штампів до подарунка"),
     ("passport_days", "🧭 Паспорт: днів"), ("points", "📍 Точки"), ("drinks", "🍵 Напої та ціни"),
     ("milks", "🥛 Молоко (доплата)"), ("syrups", "🍯 Сиропи (доплата)"), ("desserts", "🍰 Десерти"),
+    ("sizes", "📏 Розміри кави"), ("milk_over", "🥛 Доплата: молоко+напій"),
     ("lemonades", "🍋 Лимонади"), ("cocktails", "🍸 Коктейлі (алкоголь)"), ("mocktails", "🍹 Коктейлі (без алкоголю)"),
     ("promos", "📣 Шаблони акцій"), ("quiet", "🕚 Тихі години"), ("promo_time", "⏰ Час розсилки"),
     ("maps", "⭐ Відгуки по точках"), ("weekly_on", "🗓 Тижневий розбір"), ("promo_photo", "🖼 Картинка до акцій"),
@@ -1791,8 +1839,12 @@ def setting_value(key):
         return "\n".join(f"{p} - {v[p]}" for p in points() if v.get(p)) or "-"
     if key == "points":
         return ", ".join(v)
+    if key == "sizes":
+        return ", ".join(v)
+    if key == "milk_over":
+        return "; ".join(f"{k.replace('|', '+')} {'/'.join(map(str, p)) if isinstance(p, list) else p}" for k, p in v.items()) or "немає"
     if key in PRICE_KEYS:
-        return "; ".join(f"{n} {p}" for n, p in v) if v else "немає"
+        return "; ".join(f"{n} {'/'.join(map(str, p)) if isinstance(p, list) else p}" for n, p in v) if v else "немає"
     if key == "promos":
         return f"{len(v)} шт."
     if key in TOGGLES:
@@ -1801,7 +1853,7 @@ def setting_value(key):
 
 
 SETTING_GROUPS = [
-    ("menu", "☕ Меню та ціни", ["drinks", "milks", "syrups", "desserts", "lemonades", "cocktails", "mocktails"]),
+    ("menu", "☕ Меню та ціни", ["sizes", "drinks", "milk_over", "milks", "syrups", "desserts", "lemonades", "cocktails", "mocktails"]),
     ("loyal", "🎁 Лояльність", ["stamps_goal", "passport_days", "welcome_on"]),
     ("shop", "🏷 Заклад", ["shop", "points", "maps"]),
     ("safe", "🛡 Захист і бонуси", ["order_max_active", "noshow_limit", "alert_stamps_hour", "alert_gifts_day", "stamp_confirm", "stamp_cooldown", "stamp_daily_max", "ref_on", "ref_max", "gift_valid_days", "promo_valid_days", "backup_on", "birthday_on", "birthday_min_days"]),
@@ -1814,7 +1866,7 @@ def group_of(key):
 
 
 def btn_value(key):
-    if key in PRICE_KEYS or key == "points":
+    if key in PRICE_KEYS or key in ("points", "sizes", "milk_over"):
         return str(len(st.cfg(key)))
     if key == "maps":
         return f"{sum(1 for p in points() if st.cfg('maps').get(p))}/{len(points())}"
@@ -1841,8 +1893,11 @@ SETTING_HELP = {
     "passport_days": "За скільки днів треба обійти всі точки? Число від 1 до 60.",
     "points": "Перелічіть точки через кому (від 2 до 6). Приклад: Кав'ярня, Будка №1, Будка №2.\n"
               "Паспорт вимагає відвідати всі точки зі списку.",
-    "drinks": "Напої та ціни, кожен з нового рядка у форматі «Назва - ціна». Приклад:\nЕспресо - 45\nЛате - 75",
-    "milks": "Види молока й доплата, кожен з нового рядка: «Назва - доплата». Приклад:\nБананове - 25\nКокосове - 20\n"
+    "drinks": "Напої та ціни, кожен з нового рядка. Одна ціна або по розмірах через слеш (за порядком розмірів із «📏 Розміри кави»). Приклад:\nЕспресо - 45\nЛате - 75/90/105",
+    "sizes": "Розміри кави через кому (2–4). Приклад: S, M, L. Якщо змінити кількість, перепишіть ціни напоїв і молока під нову кількість.",
+    "milk_over": "Окрема доплата, коли для пари «молоко + напій» вона інша. Формат: «Молоко | Напій - ціни по розмірах». Приклад:\n"
+                 "Бананове | Лате - 10/15/20\nКокосове | Капучино - 5/10/15\nУсе інше береться зі списку молока. «-» — прибрати всі винятки.",
+    "milks": "Види молока й доплата. Одна сума або по розмірах (S/M/L): «Назва - 20/25/30». Приклад:\nБананове - 20/25/30\nКокосове - 20\n"
              "Щоб прибрати крок молока — надішліть «-». Що є в наявності сьогодні, відмічає бариста кнопкою «📦 Наявність».",
     "syrups": "Сиропи й доплата, кожен з нового рядка: «Назва - доплата». Приклад:\nКарамель - 10\nВаніль - 10\n"
               "Щоб прибрати крок сиропів — надішліть «-».",
@@ -1871,7 +1926,7 @@ SETTING_HELP = {
 }
 
 
-PRICE_LINE = re.compile(r"^(.*?)[\s\-–—:=]*\+?\s*(\d+)\s*(?:грн)?\s*$")
+PRICE_LINE = re.compile(r"^(.*?)[\s\-–—:=]*\+?\s*(\d+(?:\s*/\s*\d+)*)\s*(?:грн)?\s*$")
 
 
 def parse_setting(key, text):
@@ -1889,6 +1944,30 @@ def parse_setting(key, text):
             if len(set(ps)) != len(ps) or not 2 <= len(ps) <= 6:
                 return False, "Потрібно від 2 до 6 різних точок."
             return True, ps
+        if key == "sizes":
+            sz = [x.strip()[:12] for x in t.replace("\n", ",").split(",") if x.strip()]
+            if not 2 <= len(sz) <= 4 or len(set(sz)) != len(sz):
+                return False, "Потрібно від 2 до 4 різних розмірів через кому. Приклад: S, M, L."
+            return True, sz
+        if key == "milk_over":
+            if t in ("-", "–", "—", "0"):
+                return True, {}
+            out = {}
+            for line in t.splitlines():
+                if not line.strip():
+                    continue
+                mt = PRICE_LINE.match(line.strip())
+                head = mt.group(1).strip() if mt else ""
+                if not mt or "|" not in head:
+                    return False, f"Не вдалося розібрати: «{line.strip()[:40]}». Формат: Молоко | Напій - 10/15/20."
+                ml, dr = (x.strip() for x in head.split("|", 1))
+                nums = [int(x) for x in mt.group(2).replace(" ", "").split("/")]
+                if ml not in [n for n, _ in st.cfg("milks")] or dr not in [n for n, _ in st.cfg("drinks")]:
+                    return False, f"Молоко «{ml}» або напій «{dr}» немає в меню."
+                if len(nums) > 1 and len(nums) != len(sizes()):
+                    return False, f"Потрібно {len(sizes())} цін ({'/'.join(sizes())}) або одну."
+                out[f"{ml}|{dr}"] = nums if len(nums) > 1 else nums[0]
+            return (True, out) if out else (False, "Порожньо. Надішліть «-», щоб прибрати всі винятки.")
         if key in PRICE_KEYS:
             if key != "drinks" and t in ("-", "–", "—", "0"):
                 return True, []
@@ -1899,12 +1978,17 @@ def parse_setting(key, text):
                 mt = PRICE_LINE.match(line.strip())
                 if not mt or not mt.group(1).strip():
                     return False, f"Не вдалося розібрати рядок: «{line.strip()[:40]}». Формат: Назва - ціна."
-                name, price = mt.group(1).strip()[:30], int(mt.group(2))
-                if key == "drinks" and price < 1:
+                name = mt.group(1).strip()[:30]
+                nums = [int(x) for x in mt.group(2).replace(" ", "").split("/")]
+                if len(nums) > 1 and key not in ("drinks", "milks"):
+                    return False, f"Ціни по розмірах (55/65/75) можна лише для кави й молока: «{line.strip()[:40]}»."
+                if len(nums) > 1 and len(nums) != len(sizes()):
+                    return False, f"Розмірів зараз {len(sizes())} ({', '.join(sizes())}), а цін у рядку «{line.strip()[:30]}» — {len(nums)}."
+                if key == "drinks" and min(nums) < 1:
                     return False, "Ціна напою має бути більшою за 0."
-                if price > 9999:
+                if max(nums) > 9999:
                     return False, "Задто велика ціна."
-                out.append([name, price])
+                out.append([name, nums if len(nums) > 1 else nums[0]])
             if len({n for n, _ in out}) != len(out):
                 return False, "Назви мають бути різними."
             if not out:
